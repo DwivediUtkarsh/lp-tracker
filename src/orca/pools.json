@@ -1,0 +1,33 @@
+{
+    "283dAPj4z34T3q8YgmXsUmkibMBmNugpMuRMj2276oCc": {
+      "name": "ORCA/USDC",
+      "tokenA": "Fartcoin",
+      "tokenB": "USDC",
+      "reserveA": 123456,
+      "reserveB": 987654,
+      "decimals": 6,
+      "ammId": "???"
+    },
+    "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj": {
+      "name": "SOL/POPCAT",
+      "tokenA": "SOL",
+      "tokenB": "POPCAT",
+      "reserveA": 123456,
+      "reserveB": 987654,
+      "decimals": 6,
+      "ammId": "???"
+    },
+    "CVKMEAgzJudJuvrCWCcxX1MGoaWeAnrebx93Gxegw58h": {
+      "name": "SOL/POPCAT",
+      "tokenA": "SOL",
+      "tokenB": "POPCAT",
+      "reserveA": 123456,
+      "reserveB": 987654,
+      "decimals": 6,
+      "ammId": "???"
+    }
+
+
+    
+  }
+  

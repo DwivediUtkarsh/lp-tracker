@@ -1,27 +1,28 @@
 {
   "name": "@utkarshdwivedi/lp-tracker",
   "version": "1.0.0",
-  "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "ts-node-dev --respawn src/index.ts",
+    "dev": "tsx watch src/index.ts",
     "build": "tsc"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
-  "type": "module",
   "dependencies": {
-    "@solana/web3.js": "^1.95.8"
+    "@orca-so/common-sdk": "^0.6.11",
+    "@orca-so/whirlpools-sdk": "^0.13.20",
+    "@project-serum/anchor": "^0.26.0",
+    "@solana/web3.js": "1.95.8",
+    "decimal.js": "^10.5.0",
+    "dotenv": "^16.5.0"
   },
   "devDependencies": {
-    "@types/node": "^22.14.1",
-    "@typescript-eslint/eslint-plugin": "^8.31.0",
-    "@typescript-eslint/parser": "^8.31.0",
-    "eslint": "^9.25.1",
-    "prettier": "^3.5.3",
+    "@types/dotenv": "^8.2.3",
+    "@types/node": "^18.0.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "@typescript-eslint/parser": "^5.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^2.0.0",
     "ts-node-dev": "^2.0.0",
+    "tsx": "^4.19.3",
     "typescript": "^5.8.3"
   }
 }

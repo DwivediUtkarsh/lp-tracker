@@ -1,33 +1,21 @@
 {
-    "283dAPj4z34T3q8YgmXsUmkibMBmNugpMuRMj2276oCc": {
+    "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump": {
       "name": "ORCA/USDC",
-      "tokenA": "Fartcoin",
+      "tokenA": "ORCA",
       "tokenB": "USDC",
-      "reserveA": 123456,
-      "reserveB": 987654,
+      "reserveA": 150000,    
+      "reserveB":  75000,    
       "decimals": 6,
-      "ammId": "???"
+      "ammId":   "/* optional: Orca pool AMM account pubkey */"
     },
-    "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj": {
-      "name": "SOL/POPCAT",
-      "tokenA": "SOL",
-      "tokenB": "POPCAT",
-      "reserveA": 123456,
-      "reserveB": 987654,
+    "9BBayhfBenWrG4wKi6FaFnEe133cLvA4jRmMMc1WiHr3": {
+      "name": "ORCA/SOL",
+      "tokenA": "ORCA",
+      "tokenB": "SOL",
+      "reserveA": 200000,    
+      "reserveB":   5000,   
       "decimals": 6,
-      "ammId": "???"
-    },
-    "CVKMEAgzJudJuvrCWCcxX1MGoaWeAnrebx93Gxegw58h": {
-      "name": "SOL/POPCAT",
-      "tokenA": "SOL",
-      "tokenB": "POPCAT",
-      "reserveA": 123456,
-      "reserveB": 987654,
-      "decimals": 6,
-      "ammId": "???"
+      "ammId":   "/* optional: Orca pool AMM account pubkey */"
     }
-
-
-    
   }
   

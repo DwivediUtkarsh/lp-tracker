@@ -1,64 +1,55 @@
 #!/usr/bin/env tsx
 /**
  * src/scripts/listTokens.ts
- * Improved: retries multiple RPC endpoints on timeout.
+ *
+ * • Reads SOLANA_RPC from .env (via config.ts)
+ * • Lists all Raydium & Orca classic LP exposures for a wallet
+ * • Prints a console.table of DEX / Pool / tokenA qty / tokenB qty
  */
-console.log('🛠 listTokens script invoked')
 
-import { Connection, PublicKey } from '@solana/web3.js'
-
-// List of RPC endpoints to try, in order
-const RPC_ENDPOINTS = [
-  process.env.SOLANA_RPC,
-  'https://api.mainnet-beta.solana.com',
-  'https://solana-api.projectserum.com',
-  'https://rpc.ankr.com/solana',
-].filter(Boolean) as string[]
-
-async function tryFetchTokens(walletAddress: string) {
-  const owner = new PublicKey(walletAddress)
-
-  for (const endpoint of RPC_ENDPOINTS) {
-    console.log(`🔗 Trying RPC: ${endpoint}`)
-    const conn = new Connection(endpoint, 'confirmed')
-
-    try {
-      const { value } = await conn.getParsedTokenAccountsByOwner(owner, {
-        programId: new PublicKey(
-          'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-        ),
-      })
-
-      console.log(`\n✅ Success on ${endpoint}`)
-      console.log(`\nFound ${value.length} token accounts\n`)
-      for (const { account } of value) {
-        const info = (account.data as any).parsed.info
-        const amount = Number(info.tokenAmount.amount)
-        if (amount > 0) {
-          console.log(`${info.mint}   balance = ${amount}`)
-        }
-      }
-      return  // stop after first successful fetch
-
-    } catch (err: any) {
-      console.warn(`⚠️ RPC failed (${endpoint}): ${err.message}`)
-      // small backoff before trying next
-      await new Promise((r) => setTimeout(r, 1000))
-      continue
-    }
-  }
-
-  console.error('\n❌ All RPC endpoints failed. Check your network or try custom SOLANA_RPC.')
-  process.exit(1)
-}
+import { PublicKey } from '@solana/web3.js'
+import { RPC_ENDPOINT } from '../config.js'
+import { ReliableConnection } from '../utils/solana.js'
+import { getRaydiumExposures } from '../services/raydiumService.js'
+import { getOrcaExposures }    from '../services/orcaService.js'
 
 async function main() {
-  const [, , wallet] = process.argv
-  if (!wallet) {
-    console.error('Usage: npx tsx src/scripts/listTokens.ts <WALLET_ADDRESS>')
+  const [, , walletArg] = process.argv
+  if (!walletArg) {
+    console.error('Usage: npx tsx src/scripts/listTokens.ts <WALLET_PUBKEY>')
     process.exit(1)
   }
-  await tryFetchTokens(wallet)
+
+  const wallet = new PublicKey(walletArg)
+  console.log('🔗 RPC:', RPC_ENDPOINT)
+  console.log('👛 Wallet:', wallet.toBase58(), '\n')
+
+  const conn = new ReliableConnection(RPC_ENDPOINT)
+
+  // Fetch both DEX exposures in parallel
+  const [raydium, orca] = await Promise.all([
+    getRaydiumExposures(conn, wallet),
+    getOrcaExposures(conn,    wallet),
+  ])
+
+  const exposures = [...raydium, ...orca]
+  if (!exposures.length) {
+    console.log('No classic LP positions detected.')
+    return
+  }
+
+  // Format for console.table
+  const rows = exposures.map((e) => ({
+    DEX:   e.dex.toUpperCase(),
+    Pool:  e.pool,
+    [`${e.tokenA} qty`]: e.qtyA.toFixed(6),
+    [`${e.tokenB} qty`]: e.qtyB.toFixed(6),
+  }))
+
+  console.table(rows)
 }
 
-main()
+main().catch((err) => {
+  console.error('Error listing LP exposures:', err)
+  process.exit(1)
+})

@@ -1,52 +1,43 @@
 import { PublicKey } from '@solana/web3.js'
-import dotenv from 'dotenv'
+import { RPC_ENDPOINT } from './config.js'
 import { ReliableConnection } from './utils/solana.js'
-import { getRaydiumExposure } from './raydium/positionTracker.js'
-import { getOrcaExposure } from './orca/positionTracker.js'
-import { getWhirlpoolExposure } from './orca/whirlpoolTracker.js'
-import { Exposure } from './types/Exposure.js'
-
-dotenv.config()
+import { getRaydiumExposures } from './services/raydiumService.js'
+import { getOrcaExposures }    from './services/orcaService.js'
+import { getWhirlpoolExposures } from './services/whirlpoolService.js'
 
 async function main() {
-  const walletArg = process.argv[2]
+  const [, , walletArg] = process.argv
   if (!walletArg) {
     console.error('Usage: npm run dev <WALLET_PUBKEY>')
     process.exit(1)
   }
 
   const wallet = new PublicKey(walletArg)
-  const endpoint = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com'
-  const conn = new ReliableConnection(endpoint)
+  console.log('🔗 RPC endpoints:', RPC_ENDPOINT)
+  console.log('👛 Wallet:', wallet.toBase58(), '\n')
 
-  console.log(`🔗 RPC: ${endpoint}`)
-  console.log(`👛 Wallet: ${wallet.toBase58()}\n`)
+  const conn = new ReliableConnection(RPC_ENDPOINT)
 
-  const ray   = (await getRaydiumExposure(conn, wallet)).map(mapDex('raydium'))
-  const orcC  = (await getOrcaExposure(conn, wallet)).map(mapDex('orca-classic'))
-  const orcW  = await getWhirlpoolExposure(conn, wallet)              // already tagged
-  const all: Exposure[] = [...ray, ...orcC, ...orcW]
+  const [raydium, orca, whirl] = await Promise.all([
+    getRaydiumExposures(conn, wallet),
+    getOrcaExposures(conn, wallet),
+    getWhirlpoolExposures(conn, wallet),
+  ])
 
-  if (all.length === 0) {
-    console.log('No LP or Whirlpool positions detected.')
+  const rows = [...raydium, ...orca, ...whirl]
+  if (!rows.length) {
+    console.log('No LP positions detected.')
     return
   }
 
   console.table(
-    all.map(p => ({
-      DEX: p.dex.toUpperCase(),
-      Pool: p.pool,
-      [`${p.tokenA} qty`]: p.qtyA.toFixed(6),
-      [`${p.tokenB} qty`]: p.qtyB.toFixed(6),
-    }))
+    rows.map((r) => ({
+      DEX: r.dex,
+      Pool: r.pool,
+      [`${r.tokenA} qty`]: r.qtyA.toFixed(6),
+      [`${r.tokenB} qty`]: r.qtyB.toFixed(6),
+    })),
   )
 }
 
-function mapDex(dex: Exposure['dex']) {
-  return (e: Omit<Exposure, 'dex'>): Exposure => ({ dex, ...e })
-}
-
-main().catch(err => {
-  console.error(err)
-  process.exit(1)
-})
+main().catch(console.error)

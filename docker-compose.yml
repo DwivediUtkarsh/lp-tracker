@@ -1,17 +1,14 @@
-version: '3.8'
+version: '3'
 services:
-  db:
+  postgres:
     image: postgres:15-alpine
-    container_name: lptracker-db
-    restart: unless-stopped
+    container_name: lptracker-postgres
+    restart: always
     environment:
       POSTGRES_USER: lpuser
       POSTGRES_PASSWORD: lppass
       POSTGRES_DB: lptracker
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
-      - db-data:/var/lib/postgresql/data
-
-volumes:
-  db-data:
+      - ./pgdata:/var/lib/postgresql/data

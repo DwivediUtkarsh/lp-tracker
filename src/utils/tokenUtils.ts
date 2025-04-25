@@ -3,24 +3,48 @@ import { TOKEN_PROGRAM_ID } from './solana.js';
 import * as SPLToken from '@solana/spl-token';
 import fetch from 'node-fetch';
 
+// Interface for token metadata
+interface TokenMetadata {
+  address: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  logoURI?: string | null;
+  [key: string]: any; // Allow for additional properties
+}
+
+// Interface for token info objects
+export interface TokenInfo {
+  mint: string;
+  address: string;
+  address_label?: string;
+  balance: number;
+  decimals: number;
+  symbol: string;
+  name: string;
+  metadata: TokenMetadata;
+  isLPToken?: boolean;
+  [key: string]: any; // Allow other properties
+}
+
 // Cache for token metadata
-const tokenMetadataCache = new Map<string, any>();
+const tokenMetadataCache = new Map<string, TokenMetadata>();
 
 /**
  * Fetches token metadata from various sources
  */
-export async function getTokenMetadata(mintAddress: string): Promise<any> {
+export async function getTokenMetadata(mintAddress: string): Promise<TokenMetadata> {
   // Check cache first
   if (tokenMetadataCache.has(mintAddress)) {
-    return tokenMetadataCache.get(mintAddress);
+    return tokenMetadataCache.get(mintAddress)!;
   }
 
   try {
     // Try to fetch from Solana token list API
     const response = await fetch('https://token.jup.ag/all');
-    const tokens = await response.json();
+    const tokens = await response.json() as TokenMetadata[];
     
-    const token = tokens.find((t: any) => t.address === mintAddress);
+    const token = tokens.find((t) => t.address === mintAddress);
     
     if (token) {
       tokenMetadataCache.set(mintAddress, token);
@@ -28,29 +52,31 @@ export async function getTokenMetadata(mintAddress: string): Promise<any> {
     }
     
     // If not found, return minimal information
-    return {
+    const defaultMetadata: TokenMetadata = {
       address: mintAddress,
       symbol: mintAddress.slice(0, 4),
       name: `Unknown (${mintAddress.slice(0, 8)}...)`,
       decimals: 0,
       logoURI: null
     };
+    return defaultMetadata;
   } catch (error) {
     console.error(`Error fetching token metadata for ${mintAddress}:`, error);
-    return {
+    const errorMetadata: TokenMetadata = {
       address: mintAddress,
       symbol: mintAddress.slice(0, 4),
       name: `Error (${mintAddress.slice(0, 8)}...)`,
       decimals: 0,
       logoURI: null
     };
+    return errorMetadata;
   }
 }
 
 /**
  * Checks if the token might be an LP token based on heuristics
  */
-export function isLikelyLPToken(tokenInfo: any): boolean {
+export function isLikelyLPToken(tokenInfo: TokenInfo): boolean {
   // Known LP mint addresses for Raydium and Orca
   const knownLPMints = [
     '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump', // ORCA-USDC LP
@@ -109,7 +135,7 @@ export function formatTokenAmount(amount: string | number | bigint, decimals: nu
 /**
  * Fetches and formats all token balances for a wallet
  */
-export async function getWalletTokens(connection: Connection, walletAddress: string) {
+export async function getWalletTokens(connection: Connection, walletAddress: string): Promise<TokenInfo[]> {
   const publicKey = new PublicKey(walletAddress);
   
   // Get all token accounts for the wallet
@@ -135,7 +161,7 @@ export async function getWalletTokens(connection: Connection, walletAddress: str
         const metadata = await getTokenMetadata(mintAddress);
         
         // Create token info object
-        const tokenInfo = {
+        const tokenInfo: TokenInfo = {
           mint: mintAddress,
           address: mintAddress,
           address_label: account.pubkey.toString(),

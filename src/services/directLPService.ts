@@ -9,8 +9,34 @@ const DEX_PROGRAM_IDS = {
   ORCA_WHIRLPOOL: '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP'
 };
 
+// Define an interface for token info objects
+interface TokenInfo {
+  mint: string;
+  symbol?: string;
+  name?: string;
+  address?: string;
+  balance?: number;
+  [key: string]: any; // Allow other properties
+}
+
+// Define the structure of LP token data
+interface LPTokenData {
+  dex: string;
+  poolName: string;
+  tokenA: { symbol: string; address: string };
+  tokenB: { symbol: string; address: string };
+  reserveA: number;
+  reserveB: number;
+  totalLpSupply: number;
+}
+
+// Type for known LP tokens map
+type KnownLPTokens = {
+  [mintAddress: string]: LPTokenData;
+};
+
 // LP token information for known LP tokens
-const KNOWN_LP_TOKENS = {
+const KNOWN_LP_TOKENS: KnownLPTokens = {
   '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': {
     dex: 'orca-classic',
     poolName: 'ORCA/USDC',
@@ -64,10 +90,11 @@ export interface LPPosition {
 /**
  * Attempt to determine which DEX an LP token belongs to based on naming or metadata
  */
-function determineDex(tokenInfo: any): string {
+function determineDex(tokenInfo: TokenInfo): string {
   // First check if it's a known LP token
-  if (KNOWN_LP_TOKENS[tokenInfo.mint]) {
-    return KNOWN_LP_TOKENS[tokenInfo.mint].dex;
+  const mintAddress = tokenInfo.mint as string;
+  if (KNOWN_LP_TOKENS[mintAddress]) {
+    return KNOWN_LP_TOKENS[mintAddress].dex;
   }
 
   const { symbol = '', name = '' } = tokenInfo;
@@ -89,10 +116,11 @@ function determineDex(tokenInfo: any): string {
 /**
  * Get pool name from LP token symbol/name
  */
-function getPoolName(tokenInfo: any): string {
+function getPoolName(tokenInfo: TokenInfo): string {
   // First check if it's a known LP token
-  if (KNOWN_LP_TOKENS[tokenInfo.mint]) {
-    return KNOWN_LP_TOKENS[tokenInfo.mint].poolName;
+  const mintAddress = tokenInfo.mint as string;
+  if (KNOWN_LP_TOKENS[mintAddress]) {
+    return KNOWN_LP_TOKENS[mintAddress].poolName;
   }
 
   const { symbol = '', name = '' } = tokenInfo;
@@ -116,19 +144,21 @@ function getPoolName(tokenInfo: any): string {
 /**
  * Given an LP token, estimate the underlying tokens and amounts
  */
-async function estimateUnderlyingTokens(lpToken: any, connection: Connection): Promise<LPPosition | null> {
+async function estimateUnderlyingTokens(lpToken: TokenInfo, connection: Connection): Promise<LPPosition | null> {
   try {
     // Check if it's a known LP token
-    const knownLp = KNOWN_LP_TOKENS[lpToken.mint];
+    const mintAddress = lpToken.mint as string;
+    const knownLp = KNOWN_LP_TOKENS[mintAddress];
     if (knownLp) {
       // Calculate user's share of the pool
-      const share = lpToken.balance / knownLp.totalLpSupply;
+      const balance = lpToken.balance || 0;
+      const share = balance / knownLp.totalLpSupply;
       
       return {
         dex: knownLp.dex,
-        lpMint: lpToken.mint,
+        lpMint: mintAddress,
         poolName: knownLp.poolName,
-        userLpAmount: lpToken.balance,
+        userLpAmount: balance,
         tokenA: {
           address: knownLp.tokenA.address,
           symbol: knownLp.tokenA.symbol,
@@ -160,9 +190,9 @@ async function estimateUnderlyingTokens(lpToken: any, connection: Connection): P
     // Create basic LP position info
     const lpPosition: LPPosition = {
       dex,
-      lpMint: lpToken.mint,
+      lpMint: mintAddress,
       poolName,
-      userLpAmount: lpToken.balance,
+      userLpAmount: lpToken.balance || 0,
       tokenA: {
         address: '', // Would be fetched from pool data
         symbol: tokenSymbols[0]?.trim() || 'Unknown',
@@ -177,8 +207,8 @@ async function estimateUnderlyingTokens(lpToken: any, connection: Connection): P
     
     // For demonstration purposes, estimate token amounts - this is arbitrary
     // In a real implementation, you would calculate based on actual pool reserves
-    lpPosition.tokenA.amount = lpToken.balance * 10; // Arbitrary multiplier
-    lpPosition.tokenB.amount = lpToken.balance * 5;  // Arbitrary multiplier
+    lpPosition.tokenA.amount = (lpToken.balance || 0) * 10; // Arbitrary multiplier
+    lpPosition.tokenB.amount = (lpToken.balance || 0) * 5;  // Arbitrary multiplier
     
     return lpPosition;
   } catch (error) {

@@ -8,12 +8,13 @@ import { getDirectLPPositions } from './services/directLPService.js'
 import { saveExposureToDatabase, getPositionsForWallet, getOrCreateToken, getOrCreateWallet } from './db/models.js'
 import { getWalletTokens } from './utils/tokenUtils.js'
 import { query } from './utils/database.js';
+import { enrichPositionsWithPrices, updateTokenPricesInDb } from './services/priceService.js';
 
 async function main() {
   const [, , walletArg, action = 'fetch'] = process.argv
   if (!walletArg) {
     console.error('Usage: npm run dev <WALLET_PUBKEY> [action]')
-    console.error('Actions: fetch, db, direct, directsave, tokens')
+    console.error('Actions: fetch, db, direct, directsave, tokens, prices')
     process.exit(1)
   }
 
@@ -24,6 +25,52 @@ async function main() {
 
   // Direct connection for new functionality
   const connection = new Connection(RPC_ENDPOINT, 'confirmed')
+
+  // Real-time price updates and valuation
+  if (action === 'prices') {
+    console.log('Fetching real-time prices and LP position values...')
+    
+    // Get saved positions from database
+    const savedPositions = await getPositionsForWallet(walletAddress)
+    
+    if (!savedPositions.length) {
+      console.log('No LP positions found in database for this wallet. Run "fetch" action first.')
+      return
+    }
+    
+    // Convert string values to numbers (PostgreSQL returns numeric as strings)
+    savedPositions.forEach(pos => {
+      pos.qty_a = parseFloat(pos.qty_a);
+      pos.qty_b = parseFloat(pos.qty_b);
+    });
+    
+    // Enrich positions with real-time price data
+    const enrichedPositions = await enrichPositionsWithPrices(savedPositions)
+    
+    // Format for display
+    console.table(
+      enrichedPositions.map(p => ({
+        DEX: p.dex,
+        Pool: `${p.token_a_symbol}-${p.token_b_symbol}`,
+        [`${p.token_a_symbol}`]: p.qty_a.toFixed(4),
+        [`${p.token_a_symbol} Price`]: `$${p.token_a_price.toFixed(2)}`,
+        [`${p.token_a_symbol} Value`]: `$${p.token_a_value.toFixed(2)}`,
+        [`${p.token_b_symbol}`]: p.qty_b.toFixed(4),
+        [`${p.token_b_symbol} Price`]: `$${p.token_b_price.toFixed(2)}`,
+        [`${p.token_b_symbol} Value`]: `$${p.token_b_value.toFixed(2)}`,
+        ['Total Value']: `$${p.total_value.toFixed(2)}`
+      }))
+    )
+    
+    // Calculate and display total value across all positions
+    const totalValue = enrichedPositions.reduce((sum, pos) => sum + pos.total_value, 0)
+    console.log(`\nTotal LP Value: $${totalValue.toFixed(2)}`)
+    
+    // Update prices in database for future reference
+    await updateTokenPricesInDb()
+    
+    return
+  }
 
   // View all tokens in wallet
   if (action === 'tokens') {

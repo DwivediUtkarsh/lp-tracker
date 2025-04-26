@@ -1,62 +1,100 @@
-# LP Tracker
+# LP Tracker for Solana
 
-Track your Solana liquidity provider (LP) positions across different DEXes.
+A command-line tool to track and manage liquidity positions across different Solana DEXes (Decentralized Exchanges).
 
-## Database Setup
+## Features
 
-This project uses PostgreSQL for storing LP position data. Follow these steps to set up and use the database:
+- Track LP positions across multiple Solana DEXes:
+  - Raydium
+  - Orca
+  - Whirlpools
+- Fetch positions directly from the blockchain
+- Store and retrieve positions from a PostgreSQL database
+- Get real-time token prices and calculate position values in USD
+- Simple command-line interface
 
-### Prerequisites
+## Installation
 
-- Docker and Docker Compose installed
-- Node.js and npm installed
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/lp-tracker.git
+cd lp-tracker
+```
 
-### Setup Steps
+2. Install dependencies:
+```bash
+npm install
+```
 
-1. Create a `.env` file in the root directory with the following content:
-   ```
-   # Solana RPC endpoint
-   SOLANA_RPC=https://api.mainnet-beta.solana.com
-   
-   # Database connection string
-   DATABASE_URL=postgresql://lpuser:lppass@localhost:5433/lptracker
-   ```
+3. Set up environment variables:
+Create a `.env` file in the root directory with the following variables:
+```
+SOLANA_RPC=https://your-rpc-endpoint.com
+DATABASE_URL=postgresql://username:password@localhost:5432/lp_tracker
+```
 
-2. Start the PostgreSQL database container:
-   ```bash
-   npm run start:db
-   ```
+4. Set up the database:
+```bash
+# Start PostgreSQL (if using Docker)
+npm run start:db
 
-3. Initialize the database schema:
-   ```bash
-   npm run db:setup
-   ```
+# Create tables and initial data
+npm run db:setup
+```
 
-### Usage
+## Usage
 
-1. Fetch and save LP positions for a wallet:
-   ```bash
-   npm run dev <WALLET_ADDRESS>
-   ```
+The LP Tracker provides several commands for different functions:
 
-2. View saved positions from the database:
-   ```bash
-   npm run dev <WALLET_ADDRESS> db
-   ```
+```bash
+npm run dev <WALLET_ADDRESS> [action]
+```
 
-3. Stop the database container:
-   ```bash
-   npm run stop:db
-   ```
+Available actions:
+
+- `fetch` (default): Fetch positions from the blockchain and save to database
+- `db`: View positions stored in the database
+- `direct`: Fetch positions directly from the blockchain (without saving)
+- `directsave`: Fetch positions directly and save them to the database
+- `tokens`: View all tokens in the wallet
+- `prices`: Show real-time prices and USD values for LP positions
+
+### Examples
+
+Fetch and save positions:
+```bash
+npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1
+```
+
+View positions from database:
+```bash
+npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1 db
+```
+
+View token prices and position values:
+```bash
+npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1 prices
+```
+
+## Testing
+
+Run the test script to verify price service functionality:
+```bash
+npm run test:prices
+```
 
 ## Database Schema
 
-The database includes the following tables:
+The application uses a PostgreSQL database with the following structure:
 
-- **tokens**: Stores token information (symbol, address, decimals)
-- **wallets**: Stores wallet addresses
-- **lp_positions**: Stores LP position data for each wallet
+- `tokens`: Information about tokens (symbol, address, price)
+- `wallets`: Wallet addresses being tracked
+- `lp_positions`: LP positions linking wallets to token pairs
 
-## Development
+## Contributing
 
-To add new DEX support or modify existing functionality, check the services directory for implementation details. 
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License. 

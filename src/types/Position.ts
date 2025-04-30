@@ -1,6 +1,6 @@
 // src/types/Position.ts
 export interface Exposure {
-    dex: 'raydium' | 'orca'
+    dex: 'radium' | 'oca'
     pool: string
     tokenA: string
     tokenB: string

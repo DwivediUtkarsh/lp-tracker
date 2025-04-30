@@ -3,82 +3,116 @@
  * This service handles interactions with Orca Whirlpool liquidity pools.
  * It directly fetches position data for a wallet using the Orca SDK's fetchPositionsForOwner function.
  */
-import { PublicKey, Connection } from "@solana/web3.js";
-import { ReliableConnection } from "../utils/solana.js";
-import { Exposure } from "../types/Exposure.js";
-import { fetchPositionsForOwner, setWhirlpoolsConfig } from '@orca-so/whirlpools';
-import { createSolanaRpc, mainnet, address } from '@solana/kit';
-import { getTokenMetadata } from "../utils/tokenUtils.js";
-import { Decimal } from 'decimal.js';
+import { PublicKey, Connection } from '@solana/web3.js';
 import BN from 'bn.js';
+import { Decimal } from 'decimal.js';
 import {
-  WhirlpoolContext,
   buildWhirlpoolClient,
-  ORCA_WHIRLPOOL_PROGRAM_ID,
+  WhirlpoolContext,
+  ORCA_WHIRLPOOLS_CONFIG,
   PriceMath,
-} from "@orca-so/whirlpools-sdk";
+} from '@orca-so/whirlpools-sdk';
+import { fetchPositionsForOwner, setWhirlpoolsConfig } from '@orca-so/whirlpools';
+import { createSolanaRpc, mainnet, address as kitAddress } from '@solana/kit';
 
-// Constants for price and liquidity calculations
-const Q64 = new BN(1).shln(64);
-const protocolFeeRate = new Decimal(0.01); // 1%
+import { ReliableConnection } from '../utils/solana.js';
+import { getTokenMetadata } from '../utils/tokenUtils.js';
+import { Exposure } from '../types/Exposure.js';
 
-function sqrtPriceX64ToPrice(sqrtPriceX64: BN, decimalsA: number, decimalsB: number): Decimal {
-  const price = new Decimal(sqrtPriceX64.toString())
-    .div(new Decimal(2).pow(64))
-    .pow(2);
-  
-  return price.mul(new Decimal(10).pow(decimalsA - decimalsB));
-}
+// Add Orca Whirlpool Program ID
+const ORCA_WHIRLPOOL_PROGRAM_ID = new PublicKey('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc');
+const Q64 = new BN(1).ushln(64);
 
-function getTokenAmounts(
-  posData: any,
-  poolData: any,
-  decimalA: number,
-  decimalB: number
-): { amountA: number; amountB: number } {
+/* ------------------ helper: amounts via Uniswap v3 math ----------------- */
+function calcAmounts(posData: any, pool: any): { 
+  a: ReturnType<typeof Decimal.prototype.div>; 
+  b: ReturnType<typeof Decimal.prototype.div>; 
+} {
   try {
+    // Get token decimals from pool's token info objects
+    const tokenAInfo = pool.getTokenAInfo();
+    const tokenBInfo = pool.getTokenBInfo();
+    const decimalA = tokenAInfo.decimals;
+    const decimalB = tokenBInfo.decimals;
+    
+    const poolData = pool.getData();
+
+    if (typeof decimalA !== 'number' || typeof decimalB !== 'number') {
+      throw new Error(`Invalid decimals: A=${decimalA}, B=${decimalB}`);
+    }
+
+    // Convert to BN for precise math
     const liquidity = new BN(posData.liquidity.toString());
-    const currentTick = poolData.tickCurrentIndex;
-    const lowerTick = posData.tickLowerIndex;
-    const upperTick = posData.tickUpperIndex;
+    const sqrtPriceCurrent = new BN(poolData.sqrtPrice.toString());
+    const tickLower = posData.tickLowerIndex;
+    const tickUpper = posData.tickUpperIndex;
     
-    // Get sqrt prices
-    const currentSqrtPrice = poolData.sqrtPrice;
-    const lowerSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(lowerTick);
-    const upperSqrtPrice = PriceMath.tickIndexToSqrtPriceX64(upperTick);
+    // Safety check for invalid ticks
+    if (tickLower >= tickUpper) {
+      throw new Error('Invalid tick range');
+    }
+
+    // Get sqrt prices for position bounds using SDK math
+    const sqrtPriceLower = PriceMath.tickIndexToSqrtPriceX64(tickLower);
+    const sqrtPriceUpper = PriceMath.tickIndexToSqrtPriceX64(tickUpper);
     
+    // Add uncollected fees
+    const feeOwedA = new BN(posData.feeOwedA.toString() || '0');
+    const feeOwedB = new BN(posData.feeOwedB.toString() || '0');
+
     let amountA = new BN(0);
     let amountB = new BN(0);
 
-    if (currentTick < lowerTick) {
-      // Below range - all token A
-      const priceDiff = upperSqrtPrice.sub(lowerSqrtPrice);
-      amountA = liquidity.mul(priceDiff).div(lowerSqrtPrice);
-    } else if (currentTick < upperTick) {
-      // Within range - both tokens
-      const upperDiff = upperSqrtPrice.sub(currentSqrtPrice);
-      amountA = liquidity.mul(upperDiff).div(currentSqrtPrice);
-      amountB = liquidity.mul(currentSqrtPrice.sub(lowerSqrtPrice)).div(Q64);
+    // Handle edge cases for better numerical stability
+    if (liquidity.isZero()) {
+      // Position has no liquidity, only use fees
+      amountA = feeOwedA;
+      amountB = feeOwedB;
+    } else if (sqrtPriceCurrent.lte(sqrtPriceLower)) {
+      // Case A: Price below range - all liquidity in token A
+      amountA = liquidity
+      .mul(sqrtPriceUpper.sub(sqrtPriceLower))
+      .mul(Q64)                                    // ← multiply by 2^64
+      .div(sqrtPriceLower.mul(sqrtPriceUpper));    // ← only one division
+    } else if (sqrtPriceCurrent.gte(sqrtPriceUpper)) {
+      // Case B: Price above range - all liquidity in token B
+      amountB = liquidity.mul(sqrtPriceUpper.sub(sqrtPriceLower))
+                .shrn(64);  // Divide by 2^64 for fixed-point
     } else {
-      // Above range - all token B
-      amountB = liquidity.mul(upperSqrtPrice.sub(lowerSqrtPrice)).div(Q64);
+      // Case C: Price in range - liquidity split between both tokens
+      const numA = sqrtPriceUpper.sub(sqrtPriceCurrent);
+      const denomA = sqrtPriceCurrent.mul(sqrtPriceUpper);
+      amountA = liquidity
+      .mul(numA)
+      .mul(Q64)                                    // ← multiply by 2^64
+      .div(denomA);                                // ← only one division
+
+      const numB = sqrtPriceCurrent.sub(sqrtPriceLower);
+      amountB = liquidity.mul(numB).shrn(64);
     }
 
-    // Convert to proper decimal scaling and add fees
-    const rawAmountA = new Decimal(amountA.toString()).div(new Decimal(10).pow(decimalA));
-    const rawAmountB = new Decimal(amountB.toString()).div(new Decimal(10).pow(decimalB));
-    
-    // Add fees
-    const feeA = new Decimal(posData.feeOwedA.toString()).div(new Decimal(10).pow(decimalA));
-    const feeB = new Decimal(posData.feeOwedB.toString()).div(new Decimal(10).pow(decimalB));
+    // Add uncollected fees to amounts
+    amountA = amountA.add(feeOwedA);
+    amountB = amountB.add(feeOwedB);
+
+    // Convert to human-readable decimals
+    const decimalFactorA = new Decimal(10).pow(decimalA);
+    const decimalFactorB = new Decimal(10).pow(decimalB);
+
+    // Create decimal results with proper scaling
+    const resultA = new Decimal(amountA.toString()).div(decimalFactorA);
+    const resultB = new Decimal(amountB.toString()).div(decimalFactorB);
 
     return {
-      amountA: rawAmountA.plus(feeA).toNumber(),
-      amountB: rawAmountB.plus(feeB).toNumber(),
+      a: resultA,
+      b: resultB
     };
   } catch (error) {
-    console.error("Error calculating token amounts:", error);
-    return { amountA: 0, amountB: 0 };
+    console.error('Error calculating amounts:', error);
+    return {
+      a: new Decimal(0),
+      b: new Decimal(0)
+    };
   }
 }
 
@@ -94,7 +128,7 @@ export async function getWhirlpoolExposures(
     const rpcEndpoint = conn.endpoint;
     const rpc = createSolanaRpc(mainnet(rpcEndpoint));
     const connection = new Connection(rpcEndpoint);
-    const ownerAddress = address(owner.toBase58());
+    const ownerAddress = kitAddress(owner.toBase58());
 
     // Initialize WhirlpoolClient
     const walletAdapter = {
@@ -124,7 +158,7 @@ export async function getWhirlpoolExposures(
     for (const pos of positions) {
       try {
         if (!('data' in pos) || !('whirlpool' in pos.data)) {
-          console.log(`Skipping position bundle: ${pos.address.toString()}`);
+          console.log(`Skipping malformed position: ${pos.address.toString()}`);
           continue;
         }
 
@@ -142,39 +176,47 @@ export async function getWhirlpoolExposures(
           poolCache.set(poolAddr, pool);
         }
 
-        const poolData = pool.getData();
+        const tokenAInfo = pool.getTokenAInfo();
+        const tokenBInfo = pool.getTokenBInfo();
+        const tokenAAddress = tokenAInfo.mint.toBase58();
+        const tokenBAddress = tokenBInfo.mint.toBase58();
         
         // Get token metadata
         const [metaA, metaB] = await Promise.all([
-          getTokenMetadata(poolData.tokenMintA.toBase58()),
-          getTokenMetadata(poolData.tokenMintB.toBase58()),
+          getTokenMetadata(tokenAAddress),
+          getTokenMetadata(tokenBAddress),
         ]);
 
-        // Get symbols and decimals
-        const symA = metaA?.symbol ?? poolData.tokenMintA.toBase58().slice(0, 4);
-        const symB = metaB?.symbol ?? poolData.tokenMintB.toBase58().slice(0, 4);
-        const decA = metaA?.decimals ?? 6;
-        const decB = metaB?.decimals ?? 6;
+        // Get symbols and decimals (with fallbacks)
+        const symA = metaA?.symbol ?? tokenAAddress.slice(0, 4);
+        const symB = metaB?.symbol ?? tokenBAddress.slice(0, 4);
 
-        // Calculate amounts using updated function
-        const { amountA, amountB } = getTokenAmounts(
+        // Calculate amounts using pool's token info
+        const { a: amountA, b: amountB } = calcAmounts(
           pos.data,
-          poolData,
-          decA,
-          decB
+          pool
         );
 
-        // Create exposure object with position details
+        // For consistency with SonarWatch, we order tokens by address
+        // But preserve the original token amounts to match pool's token order
+        const shouldSwapOrder = tokenAAddress > tokenBAddress;
+        const [token1, token2] = shouldSwapOrder ? [symB, symA] : [symA, symB];
+        const [amount1, amount2] = shouldSwapOrder ? [amountB, amountA] : [amountA, amountB];
+        const [addr1, addr2] = shouldSwapOrder ? [tokenBAddress, tokenAAddress] : [tokenAAddress, tokenBAddress];
+
+        // Create exposure object with proper token ordering and amounts
         exposures.push({
           dex: "orca-whirlpool",
-          pool: `${symB}-${symA}`, // Swap order to match SonarWatch
-          tokenA: symB,
-          tokenB: symA,
-          qtyA: amountB, // Swap amounts to match token order
-          qtyB: amountA,
+          pool: `${token1}-${token2}`,
+          tokenA: token1,
+          tokenB: token2,
+          qtyA: amount1.toNumber(),
+          qtyB: amount2.toNumber(),
+          tokenAAddress: addr1,
+          tokenBAddress: addr2
         });
 
-        console.log(`  ✅ Added position ${poolAddr}: ${symB}-${symA} (A=${amountB.toFixed(6)}, B=${amountA.toFixed(6)})`);
+        console.log(`  ✅ Added position ${poolAddr}: ${token1}-${token2} (A=${amount1.toFixed(6)}, B=${amount2.toFixed(6)})`);
       } catch (error) {
         console.error(
           `[whirlpool] error processing position ${pos.address.toString()}:`,

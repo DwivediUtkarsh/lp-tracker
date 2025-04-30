@@ -50,14 +50,14 @@ export async function getRaydiumExposures(
     const lpBal = Number(raw) / 10 ** pool.decimals;
     const share = lpBal / pool.reserveA /* pretend total LP = reserveA */;
 
-    exposures.push({
-      dex: "raydium",
-      pool: pool.name,
-      tokenA: pool.tokenA,
-      tokenB: pool.tokenB,
-      qtyA: share * pool.reserveA,
-      qtyB: share * pool.reserveB,
-    });
+    // exposures.push({
+    //   dex: "raydium",
+    //   pool: pool.name,
+    //   tokenA: pool.tokenA,
+    //   tokenB: pool.tokenB,
+    //   qtyA: share * pool.reserveA,
+    //   qtyB: share * pool.reserveB,
+    // });
   }
   return exposures;
 }

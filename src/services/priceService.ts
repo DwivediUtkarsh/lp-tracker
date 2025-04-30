@@ -1,76 +1,42 @@
+/**
+ * Price Service for fetching and managing token prices
+ * 
+ * This service provides functionality to:
+ * - Fetch token prices from Jupiter's Price API V2
+ * - Cache prices to reduce API calls
+ * - Update token prices in the database
+ * - Enrich LP positions with price data
+ */
 import axios from 'axios';
 import { Token } from '../db/models.js';
 import { query } from '../utils/database.js';
 
-// Define a map of token symbols to CoinGecko IDs
-const COINGECKO_IDS: Record<string, string> = {
-  'SOL': 'solana',
-  'USDC': 'usd-coin',
-  'USDT': 'tether',
-  'ORCA': 'orca',
-  'RAY': 'raydium',
-  'mSOL': 'msol',
-  'BTC': 'bitcoin',
-  'ETH': 'ethereum',
-  'BONK': 'bonk',
-  'JUP': 'jupiter',
-  'JTO': 'jito-governance',
-  // Add more mappings as needed
-};
-
-// Token price cache to reduce API calls
+// Token price cache with TTL to minimize API calls
 const priceCache: Record<string, { price: number; timestamp: number }> = {};
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const API_DELAY = 1500; // Add delay between API calls to avoid rate limiting (1.5 seconds)
-
-// Track last API call time to prevent rate limiting
-let lastApiCallTime = 0;
 
 /**
- * Sleep for the specified number of milliseconds
+ * Fetches current price for a single token from Jupiter using Price API V2
+ * 
+ * The function:
+ * 1. Checks the in-memory cache first to avoid unnecessary API calls
+ * 2. Makes an API call to Jupiter if needed
+ * 3. Updates the cache with fresh price data
+ * 4. Falls back to expired cache data if API call fails
+ * 
+ * @param tokenMint - Solana token mint address
+ * @returns Token price in USD (0 if price not available)
  */
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-/**
- * Ensures proper rate limiting for API calls
- */
-async function respectRateLimit() {
-  const now = Date.now();
-  const timeSinceLastCall = now - lastApiCallTime;
-  
-  if (timeSinceLastCall < API_DELAY && lastApiCallTime !== 0) {
-    const delayNeeded = API_DELAY - timeSinceLastCall;
-    await sleep(delayNeeded);
-  }
-  
-  lastApiCallTime = Date.now();
-}
-
-/**
- * Get current token price from CoinGecko
- * @param tokenSymbol Token symbol
- * @returns Token price in USD
- */
-export async function getTokenPrice(tokenSymbol: string): Promise<number> {
-  const tokenId = COINGECKO_IDS[tokenSymbol.toUpperCase()];
-  
-  if (!tokenId) {
-    console.warn(`No CoinGecko ID mapping for token ${tokenSymbol}`);
-    return 0;
-  }
-  
+export async function getTokenPrice(tokenMint: string): Promise<number> {
   // Check cache first
   const now = Date.now();
-  if (priceCache[tokenId] && now - priceCache[tokenId].timestamp < CACHE_TTL) {
-    return priceCache[tokenId].price;
+  if (priceCache[tokenMint] && now - priceCache[tokenMint].timestamp < CACHE_TTL) {
+    return priceCache[tokenMint].price;
   }
   
   try {
-    // Respect rate limits
-    await respectRateLimit();
-    
     const response = await axios.get(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${tokenId}&vs_currencies=usd`,
+      `https://api.jup.ag/price/v2?ids=${tokenMint}`,
       { 
         timeout: 5000,
         headers: {
@@ -80,19 +46,19 @@ export async function getTokenPrice(tokenSymbol: string): Promise<number> {
       }
     );
     
-    const price = response.data[tokenId]?.usd || 0;
+    const price = response.data.data[tokenMint]?.price || 0;
     
     // Update cache
-    priceCache[tokenId] = { price, timestamp: now };
+    priceCache[tokenMint] = { price, timestamp: now };
     
     return price;
   } catch (error) {
-    console.error(`Error fetching price for ${tokenSymbol}:`, error);
+    console.error(`Error fetching price for ${tokenMint}:`, error);
     
     // If we have a cached price, use it even if expired
-    if (priceCache[tokenId]) {
-      console.log(`Using expired cached price for ${tokenSymbol}`);
-      return priceCache[tokenId].price;
+    if (priceCache[tokenMint]) {
+      console.log(`Using expired cached price for ${tokenMint}`);
+      return priceCache[tokenMint].price;
     }
     
     return 0;
@@ -100,40 +66,34 @@ export async function getTokenPrice(tokenSymbol: string): Promise<number> {
 }
 
 /**
- * Get current token prices for multiple tokens
- * @param tokenSymbols Array of token symbols
- * @returns Object mapping token symbols to prices
+ * Fetches current prices for multiple tokens in a single API call
+ * 
+ * Optimizes API usage by:
+ * 1. Batching multiple token price requests in one API call
+ * 2. Only fetching prices for tokens not in cache or with expired cache
+ * 3. Falling back to expired cache values if API call fails
+ * 
+ * @param tokenMints - Array of token mint addresses
+ * @returns Object mapping token mint addresses to their USD prices
  */
-export async function getTokenPrices(tokenSymbols: string[]): Promise<Record<string, number>> {
-  const prices: Record<string, number> = {};
-  
-  // Filter out symbols that have valid CoinGecko IDs
-  const validSymbols = tokenSymbols.filter(symbol => COINGECKO_IDS[symbol.toUpperCase()]);
-  
-  if (validSymbols.length === 0) {
-    return prices;
+export async function getTokenPrices(tokenMints: string[]): Promise<Record<string, number>> {
+  if (tokenMints.length === 0) {
+    return {};
   }
+
+  const prices: Record<string, number> = {};
   
   // Check which tokens need price updates
   const now = Date.now();
-  const symbolsToFetch = validSymbols.filter(symbol => {
-    const tokenId = COINGECKO_IDS[symbol.toUpperCase()];
-    return !priceCache[tokenId] || now - priceCache[tokenId].timestamp >= CACHE_TTL;
-  });
+  const mintsToFetch = tokenMints.filter(mint => 
+    !priceCache[mint] || now - priceCache[mint].timestamp >= CACHE_TTL
+  );
   
-  if (symbolsToFetch.length > 0) {
-    // Create a list of CoinGecko IDs
-    const ids = symbolsToFetch
-      .map(symbol => COINGECKO_IDS[symbol.toUpperCase()])
-      .filter(Boolean)
-      .join(',');
-    
+  if (mintsToFetch.length > 0) {
     try {
-      // Respect rate limits
-      await respectRateLimit();
-      
+      // Jupiter allows fetching multiple prices in one call
       const response = await axios.get(
-        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`,
+        `https://api.jup.ag/price/v2?ids=${mintsToFetch.join(',')}`,
         { 
           timeout: 5000,
           headers: {
@@ -144,35 +104,32 @@ export async function getTokenPrices(tokenSymbols: string[]): Promise<Record<str
       );
       
       // Update cache and prices object
-      symbolsToFetch.forEach(symbol => {
-        const tokenId = COINGECKO_IDS[symbol.toUpperCase()];
-        if (response.data[tokenId]?.usd !== undefined) {
-          const price = response.data[tokenId].usd;
-          priceCache[tokenId] = { price, timestamp: now };
-          prices[symbol] = price;
+      mintsToFetch.forEach(mint => {
+        if (response.data.data[mint]?.price !== undefined) {
+          const price = response.data.data[mint].price;
+          priceCache[mint] = { price, timestamp: now };
+          prices[mint] = price;
         } else {
-          console.warn(`No price data for ${symbol} (ID: ${tokenId})`);
+          console.warn(`No price data for ${mint}`);
         }
       });
     } catch (error) {
       console.error('Error fetching multiple token prices:', error);
       
       // Use expired cached prices if available
-      symbolsToFetch.forEach(symbol => {
-        const tokenId = COINGECKO_IDS[symbol.toUpperCase()];
-        if (priceCache[tokenId]) {
-          prices[symbol] = priceCache[tokenId].price;
-          console.log(`Using expired cached price for ${symbol}`);
+      mintsToFetch.forEach(mint => {
+        if (priceCache[mint]) {
+          prices[mint] = priceCache[mint].price;
+          console.log(`Using expired cached price for ${mint}`);
         }
       });
     }
   }
   
   // Add cached prices
-  validSymbols.forEach(symbol => {
-    const tokenId = COINGECKO_IDS[symbol.toUpperCase()];
-    if (priceCache[tokenId] && !prices[symbol]) {
-      prices[symbol] = priceCache[tokenId].price;
+  tokenMints.forEach(mint => {
+    if (priceCache[mint] && !prices[mint]) {
+      prices[mint] = priceCache[mint].price;
     }
   });
   
@@ -180,7 +137,14 @@ export async function getTokenPrices(tokenSymbols: string[]): Promise<Record<str
 }
 
 /**
- * Update token prices in the database
+ * Updates token prices in the database for all tracked tokens
+ * 
+ * The function:
+ * 1. Retrieves all tokens from the database
+ * 2. Fetches current prices from Jupiter API
+ * 3. Updates each token's price and timestamp in the database
+ * 
+ * This is typically called on a schedule to keep DB prices fresh
  */
 export async function updateTokenPricesInDb(): Promise<void> {
   try {
@@ -188,31 +152,19 @@ export async function updateTokenPricesInDb(): Promise<void> {
     const result = await query('SELECT * FROM tokens');
     const tokens: Token[] = result.rows;
     
-    // Get token symbols that have CoinGecko mappings
-    const tokenSymbols = tokens
-      .map(token => token.symbol)
-      .filter(symbol => COINGECKO_IDS[symbol.toUpperCase()]);
+    // Get token addresses for fetching prices
+    const tokenAddresses = tokens.map(token => token.address);
     
     // Fetch prices
-    const prices = await getTokenPrices(tokenSymbols);
+    const prices = await getTokenPrices(tokenAddresses);
     
-    // Update prices and coingecko_ids for tokens
+    // Update prices for tokens
     for (const token of tokens) {
-      const symbol = token.symbol.toUpperCase();
-      
-      // Update coingecko_id if not already set
-      if (COINGECKO_IDS[symbol] && !token.coingecko_id) {
-        await query(
-          'UPDATE tokens SET coingecko_id = $1 WHERE id = $2',
-          [COINGECKO_IDS[symbol], token.id]
-        );
-      }
-      
       // Update price if available
-      if (prices[token.symbol]) {
+      if (prices[token.address]) {
         await query(
           'UPDATE tokens SET price = $1, last_price_update = CURRENT_TIMESTAMP WHERE id = $2',
-          [prices[token.symbol], token.id]
+          [prices[token.address], token.id]
         );
       }
     }
@@ -224,42 +176,49 @@ export async function updateTokenPricesInDb(): Promise<void> {
 }
 
 /**
- * Calculate token values in USD for LP positions
- * @param positions Array of LP positions
- * @returns Positions with USD values
+ * Enhances LP positions with price data and calculates USD values
+ * 
+ * For each position, this function:
+ * 1. Fetches prices for all tokens in the positions
+ * 2. Calculates USD value of each token amount
+ * 3. Calculates total position value
+ * 4. Adds price and value fields to each position object
+ * 
+ * @param positions - Array of LP position objects
+ * @returns Positions enriched with price and USD value data
  */
 export async function enrichPositionsWithPrices(positions: any[]): Promise<any[]> {
   if (positions.length === 0) {
     return positions;
   }
   
-  // Extract all token symbols
-  const tokenSymbols = new Set<string>();
+  // Extract all unique token addresses
+  const tokenAddresses = new Set<string>();
   positions.forEach(pos => {
-    tokenSymbols.add(pos.token_a_symbol);
-    tokenSymbols.add(pos.token_b_symbol);
+    tokenAddresses.add(pos.token_a_address);
+    tokenAddresses.add(pos.token_b_address);
   });
   
-  console.log(`Fetching prices for tokens: ${Array.from(tokenSymbols).join(', ')}`);
+  console.log(`Fetching prices for token addresses: ${Array.from(tokenAddresses).join(', ')}`);
   
-  // Get prices for all tokens
-  const prices = await getTokenPrices(Array.from(tokenSymbols));
+  // Get prices for all tokens in a single API call
+  const prices = await getTokenPrices(Array.from(tokenAddresses));
   
   console.log('Prices fetched successfully:');
-  Object.entries(prices).forEach(([symbol, price]) => {
-    console.log(`${symbol}: $${price.toFixed(2)}`);
+  Object.entries(prices).forEach(([address, price]) => {
+    console.log(`${address.slice(0, 8)}...: $${price.toFixed(2)}`);
   });
   
-  // Enrich positions with price data
+  // Enrich positions with price data and calculate USD values
   return positions.map(pos => {
-    const tokenAValue = pos.qty_a * (prices[pos.token_a_symbol] || 0);
-    const tokenBValue = pos.qty_b * (prices[pos.token_b_symbol] || 0);
+    const tokenAValue = pos.qty_a * (prices[pos.token_a_address] || 0);
+    const tokenBValue = pos.qty_b * (prices[pos.token_b_address] || 0);
     const totalValue = tokenAValue + tokenBValue;
     
     return {
       ...pos,
-      token_a_price: prices[pos.token_a_symbol] || 0,
-      token_b_price: prices[pos.token_b_symbol] || 0,
+      token_a_price: prices[pos.token_a_address] || 0,
+      token_b_price: prices[pos.token_b_address] || 0,
       token_a_value: tokenAValue,
       token_b_value: tokenBValue,
       total_value: totalValue

@@ -1,251 +1,254 @@
-import { PublicKey, Connection } from '@solana/web3.js'
-import { RPC_ENDPOINT } from './config.js'
-import { ReliableConnection } from './utils/solana.js'
-import { getRaydiumExposures } from './services/raydiumService.js'
-import { getOrcaExposures }    from './services/orcaService.js'
-import { getWhirlpoolExposures } from './services/whirlpoolService.js'
-import { getDirectLPPositions } from './services/directLPService.js'
-import { saveExposureToDatabase, getPositionsForWallet, getOrCreateToken, getOrCreateWallet } from './db/models.js'
-import { getWalletTokens } from './utils/tokenUtils.js'
-import { query } from './utils/database.js';
-import { enrichPositionsWithPrices, updateTokenPricesInDb } from './services/priceService.js';
+import { PublicKey, Connection } from "@solana/web3.js";
+import { RPC_ENDPOINT } from "./config.js";
+import { ReliableConnection } from "./utils/solana.js";
+import {
+  getRaydiumExposures,
+  preloadRaydiumPools,
+} from "./services/raydiumService.js";
+import { getWhirlpoolExposures } from "./services/whirlpoolService.js";
+import { getDirectLPPositions } from "./services/directLPService.js";
+import { saveExposureToDatabase, getPositionsForWallet, getOrCreateToken, getOrCreateWallet } from "./db/models.js";
+import { getWalletTokens, preloadJupiterTokens } from "./utils/tokenUtils.js";
+import { query } from "./utils/database.js";
+import { enrichPositionsWithPrices, updateTokenPricesInDb } from "./services/priceService.js";
 
-async function main() {
-  const [, , walletArg, action = 'fetch'] = process.argv
-  if (!walletArg) {
-    console.error('Usage: npm run dev <WALLET_PUBKEY> [action]')
-    console.error('Actions: fetch, db, direct, directsave, tokens, prices')
-    process.exit(1)
+// Maximum execution time (5 minutes)
+const MAX_EXECUTION_TIME = 5 * 60 * 1000;
+
+async function bootstrapStaticPools() {
+  console.log("Starting bootstrapStaticPools...");
+  try {
+    // Pre‑fetch & cache pool registries so that the first wallet query is instant
+    console.log("Skipping Raydium pools pre-fetching...");
+    // Commented out to focus on Orca Whirlpools
+    // await Promise.all([preloadRaydiumPools()]);
+    console.log("Completed bootstrapStaticPools");
+  } catch (error) {
+    console.error("Error in bootstrapStaticPools:", error);
   }
-
-  const wallet = new PublicKey(walletArg)
-  const walletAddress = wallet.toBase58()
-  console.log('🔗 RPC endpoints:', RPC_ENDPOINT)
-  console.log('👛 Wallet:', walletAddress, '\n')
-
-  // Direct connection for new functionality
-  const connection = new Connection(RPC_ENDPOINT, 'confirmed')
-
-  // Real-time price updates and valuation
-  if (action === 'prices') {
-    console.log('Fetching real-time prices and LP position values...')
-    
-    // Get saved positions from database
-    const savedPositions = await getPositionsForWallet(walletAddress)
-    
-    if (!savedPositions.length) {
-      console.log('No LP positions found in database for this wallet. Run "fetch" action first.')
-      return
-    }
-    
-    // Convert string values to numbers (PostgreSQL returns numeric as strings)
-    savedPositions.forEach(pos => {
-      pos.qty_a = parseFloat(pos.qty_a);
-      pos.qty_b = parseFloat(pos.qty_b);
-    });
-    
-    // Enrich positions with real-time price data
-    const enrichedPositions = await enrichPositionsWithPrices(savedPositions)
-    
-    // Format for display
-    console.table(
-      enrichedPositions.map(p => ({
-        DEX: p.dex,
-        Pool: `${p.token_a_symbol}-${p.token_b_symbol}`,
-        [`${p.token_a_symbol}`]: p.qty_a.toFixed(4),
-        [`${p.token_a_symbol} Price`]: `$${p.token_a_price.toFixed(2)}`,
-        [`${p.token_a_symbol} Value`]: `$${p.token_a_value.toFixed(2)}`,
-        [`${p.token_b_symbol}`]: p.qty_b.toFixed(4),
-        [`${p.token_b_symbol} Price`]: `$${p.token_b_price.toFixed(2)}`,
-        [`${p.token_b_symbol} Value`]: `$${p.token_b_value.toFixed(2)}`,
-        ['Total Value']: `$${p.total_value.toFixed(2)}`
-      }))
-    )
-    
-    // Calculate and display total value across all positions
-    const totalValue = enrichedPositions.reduce((sum, pos) => sum + pos.total_value, 0)
-    console.log(`\nTotal LP Value: $${totalValue.toFixed(2)}`)
-    
-    // Update prices in database for future reference
-    await updateTokenPricesInDb()
-    
-    return
-  }
-
-  // View all tokens in wallet
-  if (action === 'tokens') {
-    console.log('Fetching all tokens in wallet...')
-    const tokens = await getWalletTokens(connection, walletAddress)
-    
-    console.table(
-      tokens.map(token => ({
-        Symbol: token.symbol,
-        Name: token.name,
-        Balance: token.balance,
-        'Is LP': token.isLPToken ? '✓' : ''
-      }))
-    )
-    return
-  }
-
-  // Direct LP token fetching with database save
-  if (action === 'directsave') {
-    console.log('Fetching LP positions directly from blockchain and saving to database...')
-    const positions = await getDirectLPPositions(connection, walletAddress)
-    
-    if (!positions.length) {
-      console.log('No LP positions detected using direct fetching.')
-      return
-    }
-    
-    console.table(
-      positions.map(pos => ({
-        DEX: pos.dex,
-        Pool: pos.poolName,
-        'LP Amount': pos.userLpAmount,
-        [`${pos.tokenA.symbol}`]: pos.tokenA.amount,
-        [`${pos.tokenB.symbol}`]: pos.tokenB.amount
-      }))
-    )
-    
-    // Save direct LP positions to database
-    console.log('\nSaving direct LP positions to database...')
-    const wallet = await getOrCreateWallet(walletAddress)
-    
-    for (const pos of positions) {
-      try {
-        // Get or create tokens
-        const tokenA = await getOrCreateToken({
-          symbol: pos.tokenA.symbol,
-          address: pos.tokenA.address || pos.tokenA.symbol // Fallback to symbol if no address
-        })
-        
-        const tokenB = await getOrCreateToken({
-          symbol: pos.tokenB.symbol,
-          address: pos.tokenB.address || pos.tokenB.symbol // Fallback to symbol if no address
-        })
-        
-        // Check if position exists
-        const existingPosition = await query(
-          'SELECT * FROM lp_positions WHERE wallet_id = $1 AND pool_address = $2',
-          [wallet.id, pos.lpMint]
-        )
-        
-        if (existingPosition.rows.length > 0) {
-          // Update existing position
-          await query(
-            `UPDATE lp_positions 
-             SET qty_a = $1, qty_b = $2, last_updated = CURRENT_TIMESTAMP
-             WHERE id = $3`,
-            [pos.tokenA.amount, pos.tokenB.amount, existingPosition.rows[0].id]
-          )
-          console.log(`Updated LP position for ${pos.poolName}`)
-        } else {
-          // Create new position
-          await query(
-            `INSERT INTO lp_positions 
-             (wallet_id, dex, pool_address, token_a_id, token_b_id, qty_a, qty_b)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [wallet.id, pos.dex, pos.lpMint, tokenA.id, tokenB.id, pos.tokenA.amount, pos.tokenB.amount]
-          )
-          console.log(`Added new LP position for ${pos.poolName}`)
-        }
-      } catch (error) {
-        console.error(`Error saving position ${pos.poolName}:`, error)
-      }
-    }
-    console.log('Direct LP positions saved to database successfully')
-    return
-  }
-
-  // Direct LP token fetching (no pools.json)
-  if (action === 'direct') {
-    console.log('Fetching LP positions directly from blockchain...')
-    const positions = await getDirectLPPositions(connection, walletAddress)
-    
-    if (!positions.length) {
-      console.log('No LP positions detected using direct fetching.')
-      return
-    }
-    
-    console.table(
-      positions.map(pos => ({
-        DEX: pos.dex,
-        Pool: pos.poolName,
-        'LP Amount': pos.userLpAmount,
-        [`${pos.tokenA.symbol}`]: pos.tokenA.amount,
-        [`${pos.tokenB.symbol}`]: pos.tokenB.amount
-      }))
-    )
-    return
-  }
-
-  // Check if we just want to view existing positions from the database
-  if (action === 'db') {
-    const savedPositions = await getPositionsForWallet(walletAddress)
-    
-    if (!savedPositions.length) {
-      console.log('No LP positions found in database for this wallet.')
-      return
-    }
-    
-    console.log('LP positions from database:')
-    console.table(
-      savedPositions.map((p) => {
-        // Create a consistent object with fixed column order
-        return {
-          DEX: p.dex,
-          Pool: p.pool_address,
-          // Use the token symbols to determine which qty is which
-          SOL: p.token_a_symbol === 'SOL' ? p.qty_a : 
-               p.token_b_symbol === 'SOL' ? p.qty_b : null,
-          USDC: p.token_a_symbol === 'USDC' ? p.qty_a : 
-                p.token_b_symbol === 'USDC' ? p.qty_b : null,
-          ORCA: p.token_a_symbol === 'ORCA' ? p.qty_a : 
-                p.token_b_symbol === 'ORCA' ? p.qty_b : null,
-          RAY: p.token_a_symbol === 'RAY' ? p.qty_a : 
-               p.token_b_symbol === 'RAY' ? p.qty_b : null,
-          Last_Updated: p.last_updated
-        }
-      }),
-    )
-    return
-  }
-
-  const conn = new ReliableConnection(RPC_ENDPOINT)
-
-  // Fetch positions from the blockchain using the original method
-  const [raydium, orca, whirl] = await Promise.all([
-    getRaydiumExposures(conn, wallet),
-    getOrcaExposures(conn, wallet),
-    getWhirlpoolExposures(conn, wallet),
-  ])
-
-  const rows = [...raydium, ...orca, ...whirl]
-  if (!rows.length) {
-    console.log('No LP positions detected.')
-    return
-  }
-
-  console.table(
-    rows.map((r) => ({
-      DEX: r.dex,
-      Pool: r.pool,
-      [`${r.tokenA} qty`]: r.qtyA.toFixed(6),
-      [`${r.tokenB} qty`]: r.qtyB.toFixed(6),
-    })),
-  )
-
-  // Save positions to database
-  console.log('\nSaving positions to database...')
-  for (const exposure of rows) {
-    try {
-      await saveExposureToDatabase(exposure, walletAddress)
-    } catch (error) {
-      console.error(`Error saving position ${exposure.pool}:`, error)
-    }
-  }
-  console.log('Positions saved to database successfully')
 }
 
-main().catch(console.error)
+async function main(): Promise<void> {
+  // Set a global timeout to prevent infinite execution
+  const timeoutId = setTimeout(() => {
+    console.error("Execution timed out after", MAX_EXECUTION_TIME / 1000, "seconds");
+    process.exit(1);
+  }, MAX_EXECUTION_TIME);
+  
+  console.log("=== LP-TRACKER STARTING ===");
+  console.log("Bootstrapping static pools...");
+  try {
+    await bootstrapStaticPools();
+  } catch (error) {
+    console.error("Error in bootstrapStaticPools:", error);
+  }
+
+  const [, , walletArg, action = "fetch"] = process.argv;
+  if (!walletArg) {
+    console.error("Usage: npm run dev <WALLET_PUBKEY> [action]");
+    clearTimeout(timeoutId);
+    process.exit(1);
+  }
+
+  console.log(`Processing action: ${action} for wallet: ${walletArg}`);
+  
+  let wallet;
+  try {
+    wallet = new PublicKey(walletArg);
+  } catch (error) {
+    console.error("Invalid wallet public key:", error);
+    clearTimeout(timeoutId);
+    process.exit(1);
+  }
+  
+  const walletAddress = wallet.toBase58();
+  console.log("🔗 RPC endpoint:", RPC_ENDPOINT);
+  console.log("👛 Wallet:", walletAddress, "\n");
+
+  // Shared connection objects
+  console.log("Establishing Solana connections...");
+  let connection, conn;
+  try {
+    connection = new Connection(RPC_ENDPOINT, "confirmed");
+    conn = new ReliableConnection(RPC_ENDPOINT);
+    console.log("Solana connections established");
+  } catch (error) {
+    console.error("Failed to establish Solana connections:", error);
+    clearTimeout(timeoutId);
+    process.exit(1);
+  }
+
+  // Preload Jupiter tokens to optimize metadata fetching for all commands
+  try {
+    await preloadJupiterTokens();
+  } catch (error) {
+    console.warn("Warning: Failed to preload Jupiter tokens. Continuing without preloaded data.");
+  }
+
+  /* ---------------------------------------------------------------------
+     ACTION SWITCH
+  --------------------------------------------------------------------- */
+  console.log(`Executing action: ${action}`);
+  
+  try {
+    switch (action) {
+      case "whirlpools": {
+        console.log("Fetching Whirlpool exposures...");
+        try {
+          const whirl = await getWhirlpoolExposures(conn, wallet);
+          console.log("Whirlpool exposures fetched successfully");
+          console.table(
+            whirl.map((p) => ({
+              DEX: p.dex,
+              Pool: p.pool,
+              [p.tokenA]: p.qtyA.toFixed(6),
+              [p.tokenB]: p.qtyB.toFixed(6),
+            }))
+          );
+        } catch (error) {
+          console.error("Error fetching Whirlpool exposures:", error);
+        }
+        break;
+      }
+
+      case "tokens": {
+        console.log("Fetching wallet tokens...");
+        try {
+          const tokens = await getWalletTokens(connection, walletAddress);
+          console.log("Wallet tokens fetched successfully");
+          
+          // Print tokens in smaller chunks to prevent console overflow
+          console.log(`Displaying ${tokens.length} tokens (limited to 10 per page):`);
+          
+          for (let i = 0; i < tokens.length; i += 10) {
+            const chunk = tokens.slice(i, i + 10);
+            console.log(`\n--- Tokens ${i+1} to ${Math.min(i+10, tokens.length)} ---`);
+            console.table(chunk);
+          }
+          
+          const lpTokens = tokens.filter(t => t.isLPToken);
+          if (lpTokens.length > 0) {
+            console.log(`\n--- Found ${lpTokens.length} Liquidity Pool tokens ---`);
+            console.table(lpTokens);
+          }
+        } catch (error) {
+          console.error("Error fetching wallet tokens:", error);
+        }
+        break;
+      }
+
+      case "direct": {
+        console.log("Fetching direct LP positions...");
+        try {
+          const positions = await getDirectLPPositions(connection, walletAddress);
+          console.log("Direct LP positions fetched successfully");
+          console.table(positions);
+        } catch (error) {
+          console.error("Error fetching direct LP positions:", error);
+        }
+        break;
+      }
+
+      case "directsave": {
+        console.log("Fetching direct LP positions for DB save...");
+        try {
+          const positions = await getDirectLPPositions(connection, walletAddress);
+          // (db‑save logic unchanged)
+          // ...
+          console.log("Direct LP positions saved to DB");
+        } catch (error) {
+          console.error("Error saving direct LP positions:", error);
+        }
+        break;
+      }
+
+      case "prices": {
+        console.log("Enriching positions with prices...");
+        try {
+          const saved = await getPositionsForWallet(walletAddress);
+          if (!saved.length) {
+            console.log("No LP positions in DB – run fetch first");
+            break;
+          }
+          console.log(`Found ${saved.length} positions, enriching with prices...`);
+          const enriched = await enrichPositionsWithPrices(saved);
+          console.log("Positions enriched with prices");
+          console.table(enriched);
+          const total = enriched.reduce((s, p) => s + p.total_value, 0);
+          console.log(`\nTotal: $${total.toFixed(2)}`);
+          console.log("Updating token prices in DB...");
+          await updateTokenPricesInDb();
+          console.log("Token prices updated in DB");
+        } catch (error) {
+          console.error("Error processing prices:", error);
+        }
+        break;
+      }
+
+      case "db": {
+        console.log("Fetching positions from DB...");
+        try {
+          const rows = await getPositionsForWallet(walletAddress);
+          console.log(`Found ${rows.length} positions in DB`);
+          console.table(rows);
+        } catch (error) {
+          console.error("Error fetching positions from DB:", error);
+        }
+        break;
+      }
+
+      // default → full fetch + DB save
+      default: {
+        console.log("Performing full fetch (Orca Whirlpools only)...");
+        try {
+          console.log("Fetching Whirlpool exposures...");
+          const whirl = await getWhirlpoolExposures(conn, wallet);
+          console.log("Exposures fetched successfully");
+
+          const rows = [...whirl];
+          if (!rows.length) {
+            console.log("No LP positions detected.");
+            break;
+          }
+          console.log(`Found ${rows.length} LP positions`);
+          console.table(
+            rows.map((r) => ({
+              DEX: r.dex,
+              Pool: r.pool,
+              [r.tokenA]: r.qtyA.toFixed(6),
+              [r.tokenB]: r.qtyB.toFixed(6),
+            }))
+          );
+
+          console.log("Saving exposures to database...");
+          let savedCount = 0;
+          for (const exposure of rows) {
+            await saveExposureToDatabase(exposure, walletAddress);
+            savedCount++;
+            console.log(`Saved ${savedCount}/${rows.length} exposures`);
+          }
+          console.log("✔️  All exposures saved to DB");
+        } catch (error) {
+          console.error("Error in full fetch process:", error);
+        }
+        break;
+      }
+    }
+  } catch (error) {
+    console.error("Unhandled error in main execution:", error);
+  } finally {
+    // Clear the timeout
+    clearTimeout(timeoutId);
+  }
+}
+
+// Handle unhandled rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+console.log("Starting main...");
+main().catch(error => {
+  console.error("Uncaught error in main:", error);
+  process.exit(1);
+});

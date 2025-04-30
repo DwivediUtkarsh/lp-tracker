@@ -6,8 +6,8 @@ A command-line tool to track and manage liquidity positions across different Sol
 
 - Track LP positions across multiple Solana DEXes:
   - Raydium
-  - Orca
-  - Whirlpools
+  - Orca (Classic)
+  - Orca Whirlpools (concentrated liquidity positions)
 - Fetch positions directly from the blockchain
 - Store and retrieve positions from a PostgreSQL database
 - Get real-time token prices and calculate position values in USD
@@ -58,6 +58,13 @@ Available actions:
 - `directsave`: Fetch positions directly and save them to the database
 - `tokens`: View all tokens in the wallet
 - `prices`: Show real-time prices and USD values for LP positions
+- `whirlpools`: Display Orca Whirlpool positions
+
+You can also use the dedicated Whirlpools command for more detailed information:
+
+```bash
+npm run whirlpools <WALLET_ADDRESS>
+```
 
 ### Examples
 
@@ -69,6 +76,13 @@ npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1
 View positions from database:
 ```bash
 npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1 db
+```
+
+View Orca Whirlpool positions:
+```bash
+npm run dev 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1 whirlpools
+# or
+npm run whirlpools 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1
 ```
 
 View token prices and position values:

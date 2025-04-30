@@ -1,55 +1,63 @@
-// src/services/raydiumService.ts
-import { PublicKey } from '@solana/web3.js'
-import { ReliableConnection, TOKEN_PROGRAM_ID } from '../utils/solana.js'
-import raydiumPoolsRaw from '../raydium/pools.json' assert { type: 'json' }
-import { Exposure } from '../types/Exposure.js'
+import { PublicKey, Connection } from "@solana/web3.js";
+import { ReliableConnection, TOKEN_PROGRAM_ID } from "../utils/solana.js";
+import { Exposure } from "../types/Exposure.js";
+import fetch from "node-fetch";
 
 interface PoolMeta {
-  name:     string
-  tokenA:   string
-  tokenB:   string
-  reserveA: number
-  reserveB: number
-  decimals: number
-  ammId:    string
+  name: string;
+  tokenA: string;
+  tokenB: string;
+  lpMint: string;
+  reserveA: number;
+  reserveB: number;
+  decimals: number;
+  id: string; // AMM ID
 }
 
-const raydiumPools = raydiumPoolsRaw as Record<string, PoolMeta>
+// In‑memory cache that can be refreshed daily
+let raydiumPools: Record<string, PoolMeta> = {};
+const POOLS_URL =
+  "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
+
+export async function preloadRaydiumPools(force = false): Promise<void> {
+  if (!force && Object.keys(raydiumPools).length) return;
+  const res = await fetch(POOLS_URL);
+  const json = (await res.json()) as PoolMeta[];
+  raydiumPools = Object.fromEntries(
+    json.map((p) => [p.lpMint, p])
+  );
+  console.log(`[raydium] cached ${json.length} pools`);
+}
 
 export async function getRaydiumExposures(
   conn: ReliableConnection,
-  owner: PublicKey,
+  owner: PublicKey
 ): Promise<Exposure[]> {
+  await preloadRaydiumPools();
   const { value } = await conn.getParsedTokenAccountsByOwner(owner, {
     programId: TOKEN_PROGRAM_ID,
-  })
-
-  const exposures: Exposure[] = []
-
+  });
+  const exposures: Exposure[] = [];
   for (const { account } of value) {
-    const info = (account.data as any).parsed.info
-    const mint = info.mint as string
-    const raw  = BigInt(info.tokenAmount.amount)
-    const dec  = info.tokenAmount.decimals as number
-    if (raw === 0n) continue
+    const info = (account.data as any).parsed.info;
+    const mint = info.mint as string;
+    const raw = BigInt(info.tokenAmount.amount);
+    if (raw === 0n) continue;
 
-    // only pools we know about
-    const pool = raydiumPools[mint]
-    if (!pool) continue
+    const pool = raydiumPools[mint];
+    if (!pool) continue;
 
-    const lpBal = Number(raw) / 10 ** dec
-    // placeholder share math—Phase 2 will replace with real on-chain reserves
-    const share = lpBal / 1_000_000
+    const lpBal = Number(raw) / 10 ** pool.decimals;
+    const share = lpBal / pool.reserveA /* pretend total LP = reserveA */;
 
     exposures.push({
-      dex:    'raydium',
-      pool:   pool.name,
+      dex: "raydium",
+      pool: pool.name,
       tokenA: pool.tokenA,
       tokenB: pool.tokenB,
-      qtyA:   share * pool.reserveA,
-      qtyB:   share * pool.reserveB,
-    })
+      qtyA: share * pool.reserveA,
+      qtyB: share * pool.reserveB,
+    });
   }
-
-  return exposures
+  return exposures;
 }

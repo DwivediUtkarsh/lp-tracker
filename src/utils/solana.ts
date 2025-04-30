@@ -1,4 +1,3 @@
-
 /**
  * utils/solana.ts
  * ----------------
@@ -20,23 +19,41 @@ import {
   
   const MAX_RETRIES = 3
   const BACKOFF_MS = 500
+  const DEFAULT_TIMEOUT_MS = 15000 // 15 second timeout
   
   export class ReliableConnection {
     constructor(
       readonly endpoint: string,
       readonly commitment: Commitment = 'confirmed',
+      readonly timeoutMs: number = DEFAULT_TIMEOUT_MS
     ) {
       this.conn = new Connection(endpoint, commitment)
     }
     private conn: Connection
   
-    // Generic retry wrapper
+    // Generic retry wrapper with timeout
     private async retry<T>(fn: () => Promise<T>, attempt = 0): Promise<T> {
       try {
-        return await fn()
+        console.log(`RPC request attempt ${attempt + 1}/${MAX_RETRIES + 1}`)
+        
+        // Create a promise that resolves with the RPC result
+        const resultPromise = fn()
+        
+        // Create a promise that rejects after timeout
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Request timed out after ${this.timeoutMs}ms`))
+          }, this.timeoutMs)
+        })
+        
+        // Race between the timeout and the actual request
+        return await Promise.race([resultPromise, timeoutPromise])
       } catch (err) {
+        console.error(`RPC error (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`, err)
         if (attempt >= MAX_RETRIES) throw err
-        await new Promise((r) => setTimeout(r, BACKOFF_MS * 2 ** attempt))
+        const backoffTime = BACKOFF_MS * 2 ** attempt
+        console.log(`Backing off for ${backoffTime}ms before retry`)
+        await new Promise((r) => setTimeout(r, backoffTime))
         return this.retry(fn, attempt + 1)
       }
     }
@@ -45,6 +62,7 @@ import {
       owner: PublicKey,
       filter: TokenAccountsFilter,
     ) {
+      console.log(`Getting parsed token accounts for ${owner.toString()}`)
       return this.retry(() =>
         this.conn.getParsedTokenAccountsByOwner(owner, filter),
       )

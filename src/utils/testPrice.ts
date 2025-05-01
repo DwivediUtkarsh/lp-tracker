@@ -5,7 +5,7 @@
  * by fetching real-time prices from Jupiter's API. It tests both single token price
  * fetching and batch price fetching for multiple tokens.
  */
-import { getTokenPrice, getTokenPrices } from '../services/priceService';
+import { getTokenPrice, getTokenPrices } from '../services/priceService.js';
 
 /**
  * Tests the price service functionality by:

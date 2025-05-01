@@ -40,3 +40,9 @@ Thumbs.db
 # Docker
 .docker/
 docker-volumes/
+
+   # Additional files
+   *.tmp
+   *.bak
+  *.backup
+   coverage/

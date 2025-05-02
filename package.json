@@ -14,6 +14,7 @@
     "directsave": "tsx src/index.ts",
     "prices": "tsx src/index.ts",
     "whirlpools": "tsx src/scripts/whirlpoolPositions.ts",
+    "portfolio": "tsx src/scripts/portfolio.ts",
     "test:prices": "tsx src/scripts/testPrices.ts",
     "test:whirlpool": "tsx src/scripts/testWhirlpool.ts",
     "test:whirlpool-new": "tsx src/scripts/testNewWhirlpoolSdk.ts"

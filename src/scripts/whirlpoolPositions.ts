@@ -73,6 +73,16 @@ async function main() {
     try {
       console.log('\nFetching price information...');
       
+      // Get unique token addresses to fetch prices for
+      const uniqueTokenAddresses = new Set<string>();
+      positions.forEach(pos => {
+        uniqueTokenAddresses.add(pos.tokenAAddress);
+        uniqueTokenAddresses.add(pos.tokenBAddress);
+      });
+      
+      console.log('Fetching prices for tokens:', 
+        Array.from(uniqueTokenAddresses).map(addr => addr.slice(0, 8) + '...').join(', '));
+      
       // Convert to the format expected by the price service
       const dbFormatPositions = positions.map((pos, index) => ({
         id: index,
@@ -82,29 +92,29 @@ async function main() {
         token_b_symbol: pos.tokenB,
         qty_a: pos.qtyA,
         qty_b: pos.qtyB,
-        token_a_address: '',
-        token_b_address: ''
+        token_a_address: pos.tokenAAddress,
+        token_b_address: pos.tokenBAddress
       }));
       
       // Enrich with prices
       const enrichedPositions = await enrichPositionsWithPrices(dbFormatPositions);
       
       // Display with value information
-      console.log('\nPosition values:');
+      console.log('\n=== Position Values ===');
       console.table(
         enrichedPositions.map(p => ({
           Pair: `${p.token_a_symbol}-${p.token_b_symbol}`,
           [`${p.token_a_symbol}`]: p.qty_a.toFixed(4),
-          [`${p.token_a_symbol} Value`]: p.token_a_price ? `$${p.token_a_value.toFixed(2)}` : 'N/A',
+          [`${p.token_a_symbol} Value`]: p.qty_a > 0 ? `$${p.token_a_value?.toFixed(2) || '0.00'}` : '-',
           [`${p.token_b_symbol}`]: p.qty_b.toFixed(4),
-          [`${p.token_b_symbol} Value`]: p.token_b_price ? `$${p.token_b_value.toFixed(2)}` : 'N/A',
-          ['Total Value']: p.total_value ? `$${p.total_value.toFixed(2)}` : 'N/A'
+          [`${p.token_b_symbol} Value`]: p.qty_b > 0 ? `$${p.token_b_value?.toFixed(2) || '0.00'}` : '-',
+          ['Position Value']: `$${p.total_value?.toFixed(2) || '0.00'}`
         }))
       );
       
       // Calculate and display total value across all positions
       const totalValue = enrichedPositions.reduce((sum, pos) => sum + (pos.total_value || 0), 0);
-      console.log(`\nTotal Whirlpool Value: $${totalValue.toFixed(2)}`);
+      console.log(`\n💰 Total Portfolio Value: $${totalValue.toFixed(2)}`);
     } catch (err: unknown) {
       if (err instanceof Error) {
         console.log('Could not fetch price information:', err.message);

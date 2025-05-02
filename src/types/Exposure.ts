@@ -7,4 +7,9 @@ export interface Exposure {
   qtyB: number;
   tokenAAddress: string;
   tokenBAddress: string;
+  tokenAPrice?: number;
+  tokenBPrice?: number;
+  tokenAValue?: number;
+  tokenBValue?: number;
+  totalValue?: number;
 }

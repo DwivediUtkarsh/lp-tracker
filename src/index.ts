@@ -10,7 +10,7 @@ import { getDirectLPPositions } from "./services/directLPService.js";
 import { saveExposureToDatabase, getPositionsForWallet, getOrCreateToken, getOrCreateWallet } from "./db/models.js";
 import { getWalletTokens, preloadJupiterTokens } from "./utils/tokenUtils.js";
 import { query } from "./utils/database.js";
-import { enrichPositionsWithPrices, updateTokenPricesInDb } from "./services/priceService.js";
+import { enrichPositionsWithPrices, updateTokenPricesInDb, getTokenPrices } from "./services/priceService.js";
 
 // Maximum execution time (5 minutes)
 const MAX_EXECUTION_TIME = 5 * 60 * 1000;
@@ -117,9 +117,54 @@ async function main(): Promise<void> {
           const tokens = await getWalletTokens(connection, walletAddress);
           console.log("Wallet tokens fetched successfully");
           
-          // Print tokens in smaller chunks to prevent console overflow
-          console.log(`Displaying ${tokens.length} tokens (limited to 10 per page):`);
+          // Filter out zero-value tokens
+          const nonZeroTokens = tokens.filter(t => t.balance > 0);
+          console.log(`Found ${nonZeroTokens.length} non-zero tokens in wallet`);
           
+          // Get addresses for price lookup
+          const tokenAddresses = nonZeroTokens.map(t => t.mint);
+          
+          // Fetch token prices
+          console.log("Fetching token prices...");
+          const prices = await getTokenPrices(tokenAddresses);
+          
+          // Create display data with value calculations
+          const tokenData = nonZeroTokens.map(t => {
+            // Ensure price is a valid number
+            const price = typeof prices[t.mint] === 'number' ? prices[t.mint] : 0;
+            const value = price * t.balance;
+            
+            return {
+              Symbol: t.symbol || 'Unknown',
+              Amount: t.balance.toFixed(6),
+              Price: price > 0 ? `$${price.toFixed(4)}` : 'N/A',
+              Value: value > 0 ? `$${value.toFixed(2)}` : 'N/A',
+              'Is LP': t.isLPToken ? 'Yes' : 'No',
+              Address: t.mint.slice(0, 8) + '...'
+            };
+          });
+          
+          // Sort by value (descending)
+          tokenData.sort((a, b) => {
+            const valueA = parseFloat((a.Value || '$0').replace('$', ''));
+            const valueB = parseFloat((b.Value || '$0').replace('$', ''));
+            return valueB - valueA;
+          });
+          
+          // Print tokens with prices and values
+          console.log(`\n--- Tokens with Values ---`);
+          console.table(tokenData);
+          
+          // Calculate total token value
+          const totalTokenValue = nonZeroTokens.reduce((sum, t) => {
+            const price = typeof prices[t.mint] === 'number' ? prices[t.mint] : 0;
+            return sum + (price * t.balance);
+          }, 0);
+          
+          console.log(`\nTotal Token Value: $${totalTokenValue.toFixed(2)}`);
+          
+          // Show original token data (limited to 10 per page)
+          console.log(`\nDetailed Token Info (limited to 10 per page):`);
           for (let i = 0; i < tokens.length; i += 10) {
             const chunk = tokens.slice(i, i + 10);
             console.log(`\n--- Tokens ${i+1} to ${Math.min(i+10, tokens.length)} ---`);

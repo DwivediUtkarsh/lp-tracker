@@ -17,6 +17,7 @@ import { createSolanaRpc, mainnet, address as kitAddress } from '@solana/kit';
 
 import { ReliableConnection } from '../utils/solana.js';
 import { getTokenMetadata } from '../utils/tokenUtils.js';
+import { getTokenPrices } from './priceService.js';
 import { Exposure } from '../types/Exposure.js';
 
 // Add Orca Whirlpool Program ID
@@ -153,8 +154,53 @@ export async function getWhirlpoolExposures(
 
     const exposures: Exposure[] = [];
     const poolCache = new Map();
+    const tokenAddresses = new Set<string>();
 
-    // Process each position
+    // Process each position - First pass to collect token addresses
+    for (const pos of positions) {
+      try {
+        if (!('data' in pos) || !('whirlpool' in pos.data)) {
+          continue;
+        }
+
+        // Get pool data (with caching)
+        const poolAddr = pos.data.whirlpool.toString();
+        let pool = poolCache.get(poolAddr);
+        if (!pool) {
+          pool = await client.getPool(pos.data.whirlpool);
+          if (!pool) {
+            continue;
+          }
+          poolCache.set(poolAddr, pool);
+        }
+
+        const tokenAInfo = pool.getTokenAInfo();
+        const tokenBInfo = pool.getTokenBInfo();
+        const tokenAAddress = tokenAInfo.mint.toBase58();
+        const tokenBAddress = tokenBInfo.mint.toBase58();
+        
+        // Collect token addresses for price fetching
+        tokenAddresses.add(tokenAAddress);
+        tokenAddresses.add(tokenBAddress);
+      } catch (error) {
+        console.error(
+          `[whirlpool] error identifying tokens for position ${pos.address.toString()}:`,
+          error
+        );
+      }
+    }
+
+    // Fetch prices for all tokens in a single API call
+    console.log(`[whirlpool] fetching prices for ${tokenAddresses.size} tokens`);
+    const tokenPrices = await getTokenPrices(Array.from(tokenAddresses));
+    console.log(`[whirlpool] prices fetched successfully`);
+
+    // Display fetched prices for debugging
+    Object.entries(tokenPrices).forEach(([address, price]) => {
+      console.log(`Token ${address.slice(0, 8)}... price: $${price.toFixed(4)}`);
+    });
+
+    // Process each position with price data
     for (const pos of positions) {
       try {
         if (!('data' in pos) || !('whirlpool' in pos.data)) {
@@ -204,7 +250,14 @@ export async function getWhirlpoolExposures(
         const [amount1, amount2] = shouldSwapOrder ? [amountB, amountA] : [amountA, amountB];
         const [addr1, addr2] = shouldSwapOrder ? [tokenBAddress, tokenAAddress] : [tokenAAddress, tokenBAddress];
 
-        // Create exposure object with proper token ordering and amounts
+        // Get token prices and calculate values
+        const token1Price = tokenPrices[addr1] || 0;
+        const token2Price = tokenPrices[addr2] || 0;
+        const token1Value = amount1.toNumber() * token1Price;
+        const token2Value = amount2.toNumber() * token2Price;
+        const totalValue = token1Value + token2Value;
+
+        // Create exposure object with proper token ordering, amounts, and values
         exposures.push({
           dex: "orca-whirlpool",
           pool: `${token1}-${token2}`,
@@ -213,10 +266,16 @@ export async function getWhirlpoolExposures(
           qtyA: amount1.toNumber(),
           qtyB: amount2.toNumber(),
           tokenAAddress: addr1,
-          tokenBAddress: addr2
+          tokenBAddress: addr2,
+          tokenAPrice: token1Price,
+          tokenBPrice: token2Price,
+          tokenAValue: token1Value,
+          tokenBValue: token2Value,
+          totalValue: totalValue
         });
 
         console.log(`  ✅ Added position ${poolAddr}: ${token1}-${token2} (A=${amount1.toFixed(6)}, B=${amount2.toFixed(6)})`);
+        console.log(`     Value: $${token1Value.toFixed(2)} + $${token2Value.toFixed(2)} = $${totalValue.toFixed(2)}`);
       } catch (error) {
         console.error(
           `[whirlpool] error processing position ${pos.address.toString()}:`,

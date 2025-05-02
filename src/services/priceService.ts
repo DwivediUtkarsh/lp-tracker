@@ -46,7 +46,14 @@ export async function getTokenPrice(tokenMint: string): Promise<number> {
       }
     );
     
-    const price = response.data.data[tokenMint]?.price || 0;
+    // Handle price as either string or number
+    let price = 0;
+    if (response.data.data && response.data.data[tokenMint] && response.data.data[tokenMint].price) {
+      // Convert to number if it's a string
+      price = typeof response.data.data[tokenMint].price === 'string' 
+        ? parseFloat(response.data.data[tokenMint].price) 
+        : response.data.data[tokenMint].price;
+    }
     
     // Update cache
     priceCache[tokenMint] = { price, timestamp: now };
@@ -105,12 +112,21 @@ export async function getTokenPrices(tokenMints: string[]): Promise<Record<strin
       
       // Update cache and prices object
       mintsToFetch.forEach(mint => {
-        if (response.data.data[mint]?.price !== undefined) {
-          const price = response.data.data[mint].price;
-          priceCache[mint] = { price, timestamp: now };
-          prices[mint] = price;
-        } else {
-          console.warn(`No price data for ${mint}`);
+        try {
+          if (response.data.data && response.data.data[mint] && response.data.data[mint].price) {
+            // Convert price to number if it's a string
+            const priceValue = response.data.data[mint].price;
+            const price = typeof priceValue === 'string' ? parseFloat(priceValue) : priceValue;
+            
+            priceCache[mint] = { price, timestamp: now };
+            prices[mint] = price;
+          } else {
+            console.warn(`No valid price data for ${mint}`);
+            prices[mint] = 0;
+          }
+        } catch (e) {
+          console.warn(`Error processing price for ${mint}:`, e);
+          prices[mint] = 0;
         }
       });
     } catch (error) {
@@ -118,9 +134,11 @@ export async function getTokenPrices(tokenMints: string[]): Promise<Record<strin
       
       // Use expired cached prices if available
       mintsToFetch.forEach(mint => {
-        if (priceCache[mint]) {
+        if (priceCache[mint] && typeof priceCache[mint].price === 'number') {
           prices[mint] = priceCache[mint].price;
           console.log(`Using expired cached price for ${mint}`);
+        } else {
+          prices[mint] = 0;
         }
       });
     }
@@ -128,8 +146,12 @@ export async function getTokenPrices(tokenMints: string[]): Promise<Record<strin
   
   // Add cached prices
   tokenMints.forEach(mint => {
-    if (priceCache[mint] && !prices[mint]) {
-      prices[mint] = priceCache[mint].price;
+    if (!prices[mint]) {
+      if (priceCache[mint] && typeof priceCache[mint].price === 'number') {
+        prices[mint] = priceCache[mint].price;
+      } else {
+        prices[mint] = 0;
+      }
     }
   });
   

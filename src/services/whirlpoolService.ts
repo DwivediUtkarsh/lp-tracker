@@ -229,8 +229,8 @@ export async function getWhirlpoolExposures(
         
         // Get token metadata
         const [metaA, metaB] = await Promise.all([
-          getTokenMetadata(tokenAAddress),
-          getTokenMetadata(tokenBAddress),
+          getTokenMetadata(connection, tokenAAddress),
+          getTokenMetadata(connection, tokenBAddress),
         ]);
 
         // Get symbols and decimals (with fallbacks)

@@ -261,6 +261,7 @@ export async function getWhirlpoolExposures(
         exposures.push({
           dex: "orca-whirlpool",
           pool: `${token1}-${token2}`,
+          positionAddress: pos.address.toString(),
           tokenA: token1,
           tokenB: token2,
           qtyA: amount1.toNumber(),
@@ -271,10 +272,11 @@ export async function getWhirlpoolExposures(
           tokenBPrice: token2Price,
           tokenAValue: token1Value,
           tokenBValue: token2Value,
-          totalValue: totalValue
+          totalValue: totalValue,
+          poolAddress: poolAddr
         });
 
-        console.log(`  ✅ Added position ${poolAddr}: ${token1}-${token2} (A=${amount1.toFixed(6)}, B=${amount2.toFixed(6)})`);
+        console.log(`  ✅ Added position ${pos.address.toString()}: ${token1}-${token2} (A=${amount1.toFixed(6)}, B=${amount2.toFixed(6)})`);
         console.log(`     Value: $${token1Value.toFixed(2)} + $${token2Value.toFixed(2)} = $${totalValue.toFixed(2)}`);
       } catch (error) {
         console.error(

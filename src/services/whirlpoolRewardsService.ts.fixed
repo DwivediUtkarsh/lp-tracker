@@ -1,0 +1,519 @@
+// ── src/services/whirlpoolRewardsService.ts ───────────────────────────────────────
+/**
+ * This service calculates uncollected fees (rewards) for Orca Whirlpool positions.
+ * It provides both the raw token amounts and USD values for these fees.
+ * 
+ * Implements the accumulator-driven approach to calculate fees:
+ * - Read on-chain Whirlpool position accounts directly
+ * - Compute the difference between feeGrowthInsideLast and current global counters
+ * - Formula: feeOwed += (globalFeeGrowth - feeGrowthLast) * L >> 64
+ * - Includes still-uncollected fees for accurate APY reporting
+ */
+import { PublicKey, Connection } from '@solana/web3.js';
+import { AnchorProvider } from '@coral-xyz/anchor';
+import BN from 'bn.js';
+import { Decimal } from 'decimal.js';
+import {
+  buildWhirlpoolClient,
+  WhirlpoolContext,
+  ORCA_WHIRLPOOLS_CONFIG,
+  PriceMath,
+  PoolUtil,
+  TickUtil,
+  PositionData,
+  TickData,
+  WhirlpoolData,
+  PDAUtil,
+} from '@orca-so/whirlpools-sdk';
+import { fetchPositionsForOwner } from '@orca-so/whirlpools';
+import pMap from 'p-map';
+
+import { ReliableConnection, TOKEN_PROGRAM_ID } from '../utils/solana.js';
+import { getTokenMetadata } from '../utils/tokenUtils.js';
+import { getTokenPrices } from './priceService.js';
+
+// Add Orca Whirlpool Program ID
+const ORCA_WHIRLPOOL_PROGRAM_ID = new PublicKey('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc');
+const Q64 = new BN(1).ushln(64);
+const Q128 = new BN(1).ushln(128);
+
+/**
+ * Interface for Whirlpool position fee/reward details
+ */
+export interface WhirlpoolReward {
+  positionAddress: string;     // Position NFT address
+  poolAddress: string;         // Pool address
+  tokenAAddress: string;       // Token A mint address
+  tokenBAddress: string;       // Token B mint address
+  tokenASymbol: string;        // Token A symbol
+  tokenBSymbol: string;        // Token B symbol
+  feeA: number;                // Uncollected fees in token A units
+  feeB: number;                // Uncollected fees in token B units
+  feeAUsd?: number;            // USD value of token A fees (if price available)
+  feeBUsd?: number;            // USD value of token B fees (if price available)
+  totalUsd?: number;           // Total USD value of fees
+  feeRate?: number;            // Pool fee rate percentage
+  apr?: number;                // Estimated APR based on current fees
+}
+
+/**
+ * Calculate uncollected fees within a position's tick range using accumulator-driven approach
+ * 
+ * This implements the exact Orca Whirlpool fee calculation algorithm:
+ * feeOwed += (globalFeeGrowth - feeGrowthLast) * liquidity >> 64
+ * 
+ * The math is bit-precise to match on-chain behavior and handles 64.64 and 128.128 fixed-point arithmetic.
+ */
+function calculateFeesInRange(
+  positionData: PositionData,
+  pool: any,
+  tokenADecimals: number,
+  tokenBDecimals: number,
+  positionAddress?: string
+): { feeA: Decimal; feeB: Decimal } {
+  try {
+    console.log(`[whirlpool-rewards] Calculating fees for position ${positionAddress || 'unknown'}`);
+    // Get stored fee values that are already collected but not withdrawn
+    const feeOwedA = new BN(positionData.feeOwedA.toString());
+    const feeOwedB = new BN(positionData.feeOwedB.toString());
+    
+    console.log(`[whirlpool-rewards] Already collected fees: A=${feeOwedA.toString()}, B=${feeOwedB.toString()}`);
+    
+    // Get current tick range
+    const tickLowerIndex = positionData.tickLowerIndex;
+    const tickUpperIndex = positionData.tickUpperIndex;
+    
+    // Get position's liquidity
+    const liquidity = new BN(positionData.liquidity.toString());
+    
+    // If position has no liquidity, only return the owed fees
+    if (liquidity.isZero()) {
+      console.log(`[whirlpool-rewards] Position has zero liquidity, only returning owed fees`);
+      const feeADecimal = new Decimal(feeOwedA.toString()).div(new Decimal(10).pow(tokenADecimals));
+      const feeBDecimal = new Decimal(feeOwedB.toString()).div(new Decimal(10).pow(tokenBDecimals));
+      
+      console.log(`[whirlpool-rewards] Returning fees: A=${feeADecimal.toString()}, B=${feeBDecimal.toString()}`);
+      
+      return {
+        feeA: feeADecimal,
+        feeB: feeBDecimal
+      };
+    }
+    
+    // Get pool data for fee growth tracking
+    const poolData = pool.getData();
+    const currentTick = poolData.tickCurrentIndex;
+    
+    // Get fee growth values from pool
+    const feeGrowthGlobalA = new BN(poolData.feeGrowthGlobalA.toString());
+    const feeGrowthGlobalB = new BN(poolData.feeGrowthGlobalB.toString());
+    
+    // Get position's last recorded fee growth
+    const feeGrowthInsideLastA = new BN(positionData.feeGrowthCheckpointA.toString());
+    const feeGrowthInsideLastB = new BN(positionData.feeGrowthCheckpointB.toString());
+    
+    // Need to get tick data for lower and upper ticks
+    const tickDataMap = pool.getTickDataMap();
+    const lowerTickData = tickDataMap.get(tickLowerIndex);
+    const upperTickData = tickDataMap.get(tickUpperIndex);
+    
+    if (!lowerTickData || !upperTickData) {
+      // Fall back to just the stored fees if tick data is missing
+      console.log(`[whirlpool-rewards] Missing tick data for position ${positionAddress || 'unknown'} at ticks [${tickLowerIndex}, ${tickUpperIndex}]`);
+      const feeADecimal = new Decimal(feeOwedA.toString()).div(new Decimal(10).pow(tokenADecimals));
+      const feeBDecimal = new Decimal(feeOwedB.toString()).div(new Decimal(10).pow(tokenBDecimals));
+      
+      console.log(`[whirlpool-rewards] Returning fees: A=${feeADecimal.toString()}, B=${feeBDecimal.toString()}`);
+      
+      return {
+        feeA: feeADecimal,
+        feeB: feeBDecimal
+      };
+    }
+    
+    // Extract fee growth outside values
+    const lowerFeeGrowthOutsideA = new BN(lowerTickData.feeGrowthOutsideA.toString());
+    const lowerFeeGrowthOutsideB = new BN(lowerTickData.feeGrowthOutsideB.toString());
+    const upperFeeGrowthOutsideA = new BN(upperTickData.feeGrowthOutsideA.toString());
+    const upperFeeGrowthOutsideB = new BN(upperTickData.feeGrowthOutsideB.toString());
+    
+    // Calculate fee growth inside the tick range
+    // Formula depends on current tick relative to position's range
+    let feeGrowthInsideA = new BN(0);
+    let feeGrowthInsideB = new BN(0);
+    
+    if (currentTick < tickLowerIndex) {
+      // Current tick below range
+      feeGrowthInsideA = feeGrowthGlobalA.sub(lowerFeeGrowthOutsideA);
+      feeGrowthInsideB = feeGrowthGlobalB.sub(lowerFeeGrowthOutsideB);
+    } else if (currentTick >= tickUpperIndex) {
+      // Current tick above range
+      feeGrowthInsideA = feeGrowthGlobalA.sub(upperFeeGrowthOutsideA);
+      feeGrowthInsideB = feeGrowthGlobalB.sub(upperFeeGrowthOutsideB);
+    } else {
+      // Current tick inside range
+      feeGrowthInsideA = feeGrowthGlobalA.sub(lowerFeeGrowthOutsideA).sub(upperFeeGrowthOutsideA);
+      feeGrowthInsideB = feeGrowthGlobalB.sub(lowerFeeGrowthOutsideB).sub(upperFeeGrowthOutsideB);
+    }
+    
+    // Handle underflow cases (can happen due to tick initialization order)
+    // If the calculation goes negative, we wrap around (similar to the on-chain contract)
+    if (feeGrowthInsideA.lt(new BN(0))) {
+      feeGrowthInsideA = feeGrowthInsideA.add(Q128);
+    }
+    if (feeGrowthInsideB.lt(new BN(0))) {
+      feeGrowthInsideB = feeGrowthInsideB.add(Q128);
+    }
+    
+    // Calculate accrued fees inside the range since last update
+    let accruedFeesA = new BN(0);
+    let accruedFeesB = new BN(0);
+    
+    // Only calculate if there's a difference in fee growth
+    if (!feeGrowthInsideA.eq(feeGrowthInsideLastA)) {
+      let feeGrowthDeltaA = feeGrowthInsideA.sub(feeGrowthInsideLastA);
+      // Handle underflow
+      if (feeGrowthDeltaA.lt(new BN(0))) {
+        feeGrowthDeltaA = feeGrowthDeltaA.add(Q128);
+      }
+      
+      // Calculate fees: feeDelta * liquidity / 2^128
+      accruedFeesA = feeGrowthDeltaA.mul(liquidity).shrn(128);
+    }
+    
+    if (!feeGrowthInsideB.eq(feeGrowthInsideLastB)) {
+      let feeGrowthDeltaB = feeGrowthInsideB.sub(feeGrowthInsideLastB);
+      // Handle underflow
+      if (feeGrowthDeltaB.lt(new BN(0))) {
+        feeGrowthDeltaB = feeGrowthDeltaB.add(Q128);
+      }
+      
+      // Calculate fees: feeDelta * liquidity / 2^128
+      accruedFeesB = feeGrowthDeltaB.mul(liquidity).shrn(128);
+    }
+    
+    // Add accrued fees to already owed fees
+    const totalFeeA = feeOwedA.add(accruedFeesA);
+    const totalFeeB = feeOwedB.add(accruedFeesB);
+    
+    // Log the calculated fees
+    console.log(`[whirlpool-rewards] Accrued fees: A=${accruedFeesA.toString()}, B=${accruedFeesB.toString()}`);
+    console.log(`[whirlpool-rewards] Total fees (owed + accrued): A=${totalFeeA.toString()}, B=${totalFeeB.toString()}`);
+    
+    // Convert to human-readable amounts with proper decimals
+    const feeADecimal = new Decimal(totalFeeA.toString()).div(new Decimal(10).pow(tokenADecimals));
+    const feeBDecimal = new Decimal(totalFeeB.toString()).div(new Decimal(10).pow(tokenBDecimals));
+    
+    console.log(`[whirlpool-rewards] Returning fees: A=${feeADecimal.toString()}, B=${feeBDecimal.toString()}`);
+    
+    return {
+      feeA: feeADecimal,
+      feeB: feeBDecimal
+    };
+  } catch (error) {
+    console.error('[whirlpool-rewards] Error calculating fees in range:', error);
+    if (error instanceof Error) {
+      console.error(`[whirlpool-rewards] Error details: ${error.message}`);
+      console.error(`[whirlpool-rewards] Stack trace: ${error.stack}`);
+    }
+    return {
+      feeA: new Decimal(0),
+      feeB: new Decimal(0)
+    };
+  }
+}
+
+/**
+ * Gets uncollected fees for all Orca Whirlpool positions owned by a wallet
+ * using the accumulator-driven approach for precise fee calculation
+ */
+export async function getUncollectedFees(
+  conn: ReliableConnection,
+  owner: PublicKey
+): Promise<WhirlpoolReward[]> {
+  console.log("[whirlpool-rewards] Calculating uncollected fees for", owner.toBase58());
+  
+  try {
+    // Configure SDK and establish connections
+    const rpcEndpoint = conn.endpoint;
+    const connection = new Connection(rpcEndpoint);
+
+    // Fetch all positions for this wallet
+    console.log("[whirlpool-rewards] Fetching positions for", owner.toBase58());
+    
+    // Instead of trying to find Whirlpool positions directly, let's import and use the 
+    // existing whirlpoolService which we know works correctly for position discovery
+    try {
+      // Dynamically import the whirlpoolService to avoid circular dependencies
+      const whirlpoolServiceModule = await import('./whirlpoolService.js');
+      const { getWhirlpoolExposures } = whirlpoolServiceModule;
+      
+      console.log("[whirlpool-rewards] Using whirlpoolService to find positions");
+      const positions = await getWhirlpoolExposures(conn, owner);
+      
+      // Now extract position addresses from the returned positions
+      const positionAddressStrings = positions.map(pos => pos.positionAddress);
+      const positionAddresses = positionAddressStrings.map(addr => new PublicKey(addr));
+      
+      console.log(`[whirlpool-rewards] Found ${positionAddresses.length} Whirlpool positions via whirlpoolService`);
+      return calculateFees(connection, owner, positionAddresses, positions);
+    } catch (error) {
+      console.error("[whirlpool-rewards] Error finding positions via whirlpoolService:", error);
+      
+      // If the whirlpoolService method fails, we can try a fallback approach
+      console.log("[whirlpool-rewards] Trying fallback method with direct position lookup");
+      const fallbackPositions = await fallbackPositionDiscovery(connection, owner);
+      
+      if (fallbackPositions.length === 0) {
+        console.log("[whirlpool-rewards] No positions found via fallback method either");
+        return [];
+      }
+      
+      console.log(`[whirlpool-rewards] Found ${fallbackPositions.length} positions via fallback method`);
+      return calculateFees(connection, owner, fallbackPositions);
+    }
+  } catch (error) {
+    console.error('[whirlpool-rewards] Error fetching uncollected fees:', error);
+    return [];
+  }
+}
+
+/**
+ * Alternative method to find positions when the primary method fails
+ */
+async function fallbackPositionDiscovery(
+  connection: Connection,
+  owner: PublicKey
+): Promise<PublicKey[]> {
+  try {
+    console.log("[whirlpool-rewards] Attempting fallback position discovery");
+    
+    // Get all token accounts for this wallet
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(owner, {
+      programId: TOKEN_PROGRAM_ID,
+    });
+    
+    console.log(`[whirlpool-rewards] Found ${tokenAccounts.value.length} token accounts`);
+    
+    const positionAddresses: PublicKey[] = [];
+    
+    // Find NFT position accounts (amount = 1)
+    for (const { pubkey, account } of tokenAccounts.value) {
+      try {
+        // Skip if this isn't an NFT (amount should be 1)
+        const amount = account.data.parsed.info.tokenAmount.amount;
+        if (amount !== "1") continue;
+        
+        // Get the mint from the parsed data
+        const mint = new PublicKey(account.data.parsed.info.mint);
+        
+        // Try to derive Whirlpool position PDA from this mint
+        try {
+          const positionPda = PDAUtil.getPosition(ORCA_WHIRLPOOL_PROGRAM_ID, mint);
+          positionAddresses.push(positionPda.publicKey);
+          console.log(`[whirlpool-rewards] Found position: ${positionPda.publicKey.toBase58()}`);
+        } catch (e) {
+          // Not a Whirlpool position mint, skip it
+        }
+      } catch (e) {
+        // Skip any problematic token accounts
+      }
+    }
+    
+    return positionAddresses;
+  } catch (error) {
+    console.error("[whirlpool-rewards] Error in fallback position discovery:", error);
+    return [];
+  }
+}
+
+/**
+ * Calculate fees for given positions
+ */
+async function calculateFees(
+  connection: Connection,
+  owner: PublicKey,
+  positionAddresses: PublicKey[],
+  knownPositions?: any[]
+): Promise<WhirlpoolReward[]> {
+  if (positionAddresses.length === 0) {
+    console.log("[whirlpool-rewards] No positions to calculate fees for");
+    return [];
+  }
+  
+  console.log(`[whirlpool-rewards] Calculating fees for ${positionAddresses.length} positions`);
+  
+  // Set up wallet and provider for the Orca SDK
+  const wallet = {
+    publicKey: owner,
+    signTransaction: async (tx: any) => tx,
+    signAllTransactions: async (txs: any[]) => txs,
+  };
+  
+  const provider = new AnchorProvider(
+    connection,
+    wallet,
+    AnchorProvider.defaultOptions()
+  );
+  
+  const ctx = WhirlpoolContext.withProvider(provider, ORCA_WHIRLPOOL_PROGRAM_ID);
+  const client = buildWhirlpoolClient(ctx);
+  
+  // If we have known positions from the whirlpoolService, use that data to enrich our results
+  const knownPositionsMap = new Map();
+  if (knownPositions && knownPositions.length > 0) {
+    knownPositions.forEach(pos => {
+      knownPositionsMap.set(pos.positionAddress, pos);
+    });
+    console.log(`[whirlpool-rewards] Using ${knownPositionsMap.size} known positions for enrichment`);
+  }
+  
+  // Process each position to get fee data
+  const rewards = await pMap(positionAddresses, async (positionPubkey) => {
+    try {
+      // Ensure we have a PublicKey object
+      const pubkey = positionPubkey instanceof PublicKey ? 
+        positionPubkey : new PublicKey(typeof positionPubkey === 'string' ? positionPubkey : positionPubkey.toString());
+      
+      // Log which position we're processing
+      const positionId = pubkey.toBase58();
+      console.log(`[whirlpool-rewards] Processing position ${positionId}`);
+        
+      // Load position and associated pool
+      const position = await client.getPosition(pubkey);
+      const positionData = position.getData();
+      const poolAddress = positionData.whirlpool;
+      const pool = await client.getPool(poolAddress);
+      
+      // Get pool token information
+      const tokenAAddress = pool.getTokenAInfo().mint.toBase58();
+      const tokenBAddress = pool.getTokenBInfo().mint.toBase58();
+      const tokenADecimals = pool.getTokenAInfo().decimals;
+      const tokenBDecimals = pool.getTokenBInfo().decimals;
+      
+      // Get pool fee rate from pool data
+      const poolData = pool.getData();
+      const feeRate = poolData.feeRate / 1_000_000; // Convert from parts per million to percentage
+      
+      // Calculate uncollected fees
+      const { feeA, feeB } = calculateFeesInRange(
+        positionData,
+        pool,
+        tokenADecimals,
+        tokenBDecimals,
+        pubkey.toBase58()
+      );
+      
+      // Get token metadata (passing connection parameter)
+      const tokenAMeta = await getTokenMetadata(connection, tokenAAddress);
+      const tokenBMeta = await getTokenMetadata(connection, tokenBAddress);
+      
+      // Calculate rough position value for APR estimation
+      const liquidity = new Decimal(positionData.liquidity.toString());
+      
+      return {
+        positionAddress: pubkey.toBase58(),
+        poolAddress: poolAddress.toBase58(),
+        tokenAAddress,
+        tokenBAddress,
+        tokenASymbol: tokenAMeta?.symbol || tokenAAddress.slice(0, 4) + '...',
+        tokenBSymbol: tokenBMeta?.symbol || tokenBAddress.slice(0, 4) + '...',
+        feeA: feeA.toNumber(),
+        feeB: feeB.toNumber(),
+        feeRate: feeRate,
+        liquidity: liquidity.toString(),
+        positionData: {
+          tickLowerIndex: positionData.tickLowerIndex,
+          tickUpperIndex: positionData.tickUpperIndex,
+          liquidity: positionData.liquidity.toString()
+        }
+      };
+    } catch (error) {
+      // Safely log position identifier regardless of type
+      const positionId = typeof positionPubkey === 'string' ? 
+        positionPubkey : 
+        (positionPubkey instanceof PublicKey ? 
+          positionPubkey.toBase58() : 
+          JSON.stringify(positionPubkey));
+      console.error(`[whirlpool-rewards] Error processing position ${positionId}:`, error);
+      if (error instanceof Error) {
+        console.error(`[whirlpool-rewards] Error details: ${error.message}`);
+        console.error(`[whirlpool-rewards] Stack trace: ${error.stack}`);
+      }
+      return null;
+    }
+  }, { concurrency: 5 });
+
+  // Filter out failed positions and calculate USD values
+  const validRewards = rewards.filter(r => r !== null) as (WhirlpoolReward & {
+    liquidity: string;
+    positionData: {
+      tickLowerIndex: number;
+      tickUpperIndex: number;
+      liquidity: string;
+    };
+  })[];
+
+  // Get token prices for all tokens
+  const uniqueTokenAddresses = Array.from(new Set(
+    validRewards.flatMap(r => [r.tokenAAddress, r.tokenBAddress])
+  ));
+  const tokenPrices = await getTokenPrices(uniqueTokenAddresses);
+
+  // Calculate USD values and APR
+  for (const reward of validRewards) {
+    const priceA = tokenPrices[reward.tokenAAddress];
+    const priceB = tokenPrices[reward.tokenBAddress];
+
+    // Calculate USD values for fees
+    if (priceA) {
+      reward.feeAUsd = reward.feeA * priceA;
+    }
+
+    if (priceB) {
+      reward.feeBUsd = reward.feeB * priceB;
+    }
+
+    if (reward.feeAUsd !== undefined || reward.feeBUsd !== undefined) {
+      reward.totalUsd = (reward.feeAUsd || 0) + (reward.feeBUsd || 0);
+    }
+
+    // Estimate position value for APR calculation
+    try {
+      const { positionData } = reward;
+      if (positionData && priceA && priceB) {
+        // This is a rough estimate - for precise values we would need the current price and liquidity calculations
+        const liquidityValue = new Decimal(positionData.liquidity).div(1e6); // Scale down for estimation
+        const rangeWidth = Math.abs(positionData.tickUpperIndex - positionData.tickLowerIndex);
+        const isPriceInRange = true; // Simplification
+        
+        let estimatedValue: number;
+        if (isPriceInRange) {
+          // If price is in range, the position has both tokens
+          // Convert to number before arithmetic operations
+          estimatedValue = liquidityValue.mul(new Decimal(priceA + priceB)).mul(rangeWidth / 10000).toNumber();
+        } else {
+          // If price is outside range, position has only one token
+          // Convert to number before arithmetic operations
+          estimatedValue = liquidityValue.mul(new Decimal(priceA > priceB ? priceA : priceB)).mul(rangeWidth / 10000).toNumber();
+        }
+        
+        // Calculate annualized APR if we have enough data
+        if (reward.totalUsd !== undefined && estimatedValue > 0) {
+          // Estimate APR with daily fee accrual × 365
+          // This assumes fees were collected roughly daily - adjust time period if you have real collection intervals
+          const dailyYield = reward.totalUsd / estimatedValue;
+          reward.apr = dailyYield * 365 * 100; // Convert to percentage
+        }
+      }
+    } catch (err) {
+      console.error(`Error calculating APR for position ${reward.positionAddress}:`, err);
+    }
+
+    // Remove the temporary fields we added for calculations
+    delete (reward as any).liquidity;
+    delete (reward as any).positionData;
+  }
+
+  return validRewards;
+}

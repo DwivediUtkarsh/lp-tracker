@@ -15,6 +15,7 @@ import { RPC_ENDPOINT } from '../config.js';
 import { getWhirlpoolExposures } from '../services/whirlpoolService.js';
 import { getTokenMetadata, getWalletTokens } from '../utils/tokenUtils.js';
 import { enrichPositionsWithPrices, getTokenPrices } from '../services/priceService.js';
+import { getUncollectedFees } from '../services/whirlpoolRewardsService.js';
 
 async function main() {
   // Parse command line arguments
@@ -40,6 +41,7 @@ async function main() {
     console.log('===============================\n');
     
     let totalPortfolioValue = 0;
+    let whirlpoolRewards: any[] = [];
     
     // PART 1: Fetch wallet tokens
     console.log('PART 1: TOKENS');
@@ -119,6 +121,16 @@ async function main() {
         }))
       );
       
+      // Fetch uncollected fees/rewards
+      console.log('\nFetching uncollected fees and rewards...');
+      whirlpoolRewards = await getUncollectedFees(conn, wallet);
+      console.log(`Found fee data for ${whirlpoolRewards.length} positions`);
+      
+      // Create a map for quick lookup
+      const rewardsMap = new Map(
+        whirlpoolRewards.map(reward => [reward.positionAddress, reward])
+      );
+      
       // Get unique token addresses to fetch prices for
       const uniqueTokenAddresses = new Set<string>();
       positions.forEach(pos => {
@@ -163,13 +175,42 @@ async function main() {
       const totalWhirlpoolValue = enrichedPositions.reduce((sum, pos) => sum + (pos.total_value || 0), 0);
       console.log(`\n💰 Total Whirlpool Value: $${totalWhirlpoolValue.toFixed(2)}`);
       totalPortfolioValue += totalWhirlpoolValue;
+      
+      // Display uncollected fees
+      console.log('\n=== Uncollected Fees (Rewards) ===');
+      const feesData = positions.map(pos => {
+        const reward = rewardsMap.get(pos.positionAddress);
+        return {
+          Pair: pos.pool,
+          [`${pos.tokenA} Fees`]: reward ? reward.feeA.toFixed(6) : '-',
+          [`${pos.tokenA} Fees Value`]: reward?.feeAUsd ? `$${reward.feeAUsd.toFixed(2)}` : '-',
+          [`${pos.tokenB} Fees`]: reward ? reward.feeB.toFixed(6) : '-',
+          [`${pos.tokenB} Fees Value`]: reward?.feeBUsd ? `$${reward.feeBUsd.toFixed(2)}` : '-',
+          ['Total Fees Value']: reward?.totalUsd ? `$${reward.totalUsd.toFixed(2)}` : '-',
+        };
+      });
+      console.table(feesData);
+      
+      // Calculate total fees value
+      const totalFeesValue = whirlpoolRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0);
+      console.log(`\n💸 Total Uncollected Fees: $${totalFeesValue.toFixed(2)}`);
+      
+      // Add fees to portfolio total
+      totalPortfolioValue += totalFeesValue;
     }
     
     // PART 3: Portfolio Summary
     console.log('\n\n📈 PORTFOLIO SUMMARY 📈');
     console.log('=======================');
     console.log(`Token Value:     $${totalTokenValue.toFixed(2)}`);
-    console.log(`Whirlpool Value: $${(totalPortfolioValue - totalTokenValue).toFixed(2)}`);
+    
+    // Calculate whirlpool value and fees separately
+    const whirlpoolPositionValue = totalPortfolioValue - totalTokenValue;
+    const whirlpoolFeesValue = whirlpoolRewards.length > 0 ? whirlpoolRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0) : 0;
+    const whirlpoolTotalValue = whirlpoolPositionValue - whirlpoolFeesValue;
+    
+    console.log(`Whirlpool Value: $${whirlpoolTotalValue.toFixed(2)}`);
+    console.log(`Uncollected Fees: $${whirlpoolFeesValue.toFixed(2)}`);
     console.log('------------------------------');
     console.log(`TOTAL VALUE:     $${totalPortfolioValue.toFixed(2)}`);
     

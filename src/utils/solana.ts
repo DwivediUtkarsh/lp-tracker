@@ -67,6 +67,12 @@ import {
         this.conn.getParsedTokenAccountsByOwner(owner, filter),
       )
     }
+    
+    // Get the underlying Connection object
+    // This is useful for functions that require a native Connection object
+    getConnection(): Connection {
+      return this.conn;
+    }
   }
   
   /**

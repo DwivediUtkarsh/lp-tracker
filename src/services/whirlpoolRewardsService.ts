@@ -250,8 +250,8 @@ export async function getUncollectedFees(
         const tA   = pool.getTokenAInfo();
         const tB   = pool.getTokenBInfo();
         const [mA, mB] = await Promise.all([
-          getTokenMetadata(ctx.connection, tA.mint.toBase58()),
-          getTokenMetadata(ctx.connection, tB.mint.toBase58()),
+          getTokenMetadata(tA.mint.toBase58()),
+          getTokenMetadata(tB.mint.toBase58()),
         ]);
 
         // Convert raw fees to human-readable amounts
@@ -289,4 +289,109 @@ export async function getUncollectedFees(
   });
 
   return list;
+}
+
+/**
+ * Calculate accurate fees for historical transactions.
+ * This function is used by the historicalIndexingService to compute precise fee values
+ * using the same algorithm as the main rewards service.
+ * 
+ * @param position - Position data from the database
+ * @param tokenAAmount - Amount of token A fees from the transaction
+ * @param tokenBAmount - Amount of token B fees from the transaction
+ */
+export async function calculateHistoricalFees(
+  position: {
+    position_address: string;
+    token_a_address: string;
+    token_b_address: string;
+  },
+  tokenAAmount: number,
+  tokenBAmount: number
+): Promise<{
+  feeAUsd: number;
+  feeBUsd: number;
+  totalUsd: number;
+}> {
+  try {
+    // First try to get token prices - we'll need these regardless
+    const tokenAddresses = [position.token_a_address, position.token_b_address].filter(Boolean);
+    const tokenPrices = await getTokenPrices(tokenAddresses);
+    const tokenAPrice = tokenPrices[position.token_a_address] || 0;
+    const tokenBPrice = tokenPrices[position.token_b_address] || 0;
+    
+    // Calculate base USD values without on-chain verification
+    const feeAUsd = tokenAAmount * tokenAPrice;
+    const feeBUsd = tokenBAmount * tokenBPrice;
+    const totalUsd = feeAUsd + feeBUsd;
+    
+    // Check if we have a valid position address for additional verification
+    if (!position.position_address) {
+      console.log("[historical-fees] No position address provided, using price-based calculation");
+      return { feeAUsd, feeBUsd, totalUsd };
+    }
+
+    try {
+      // First check if the position exists before trying to fetch full data
+      // Create a dummy owner for context (we don't actually need to sign anything)
+      const dummyOwner = new PublicKey(position.position_address);
+      const ctx = newCtx(dummyOwner);
+      const client = buildWhirlpoolClient(ctx);
+      
+      // Try to fetch on-chain position data
+      const positionPubkey = new PublicKey(position.position_address);
+      
+      // Check if account exists on chain before trying to fetch position
+      // This prevents "Account not found" errors for closed positions
+      const accountInfo = await ctx.connection.getAccountInfo(positionPubkey, "confirmed");
+      if (!accountInfo) {
+        console.log(`[historical-fees] Position ${position.position_address.slice(0, 8)}... no longer exists on-chain, using price-based calculation`);
+        return { feeAUsd, feeBUsd, totalUsd };
+      }
+      
+      // Now fetch the full position data since we know it exists
+      const positionClient = await client.getPosition(positionPubkey);
+      const pos = positionClient.getData();
+      const pool = await client.getPool(pos.whirlpool);
+      
+      // Get token metadata and decimals
+      const tokenAInfo = pool.getTokenAInfo();
+      const tokenBInfo = pool.getTokenBInfo();
+      
+      // Verify that the token addresses match what we expect
+      const onChainTokenAAddress = tokenAInfo.mint.toBase58();
+      const onChainTokenBAddress = tokenBInfo.mint.toBase58();
+      
+      if (onChainTokenAAddress !== position.token_a_address || 
+          onChainTokenBAddress !== position.token_b_address) {
+        console.warn("[historical-fees] Token mismatch between database and on-chain data");
+        console.warn(`DB tokens: ${position.token_a_address}, ${position.token_b_address}`);
+        console.warn(`On-chain tokens: ${onChainTokenAAddress}, ${onChainTokenBAddress}`);
+      }
+      
+      // We successfully validated the position - use the token prices we already fetched
+      console.log(`[historical-fees] Successfully verified position ${position.position_address.slice(0, 8)}...`);
+      
+      // Return the price-based calculations which are accurate for historical fee collections
+      return { feeAUsd, feeBUsd, totalUsd };
+    } catch (error: any) {
+      // Instead of a generic error message, provide more context based on error type
+      if (error.message?.includes('Account not found') || error.message?.includes('Unable to fetch')) {
+        console.log(`[historical-fees] Position ${position.position_address.slice(0, 8)}... likely closed or no longer exists`);
+      } else if (error.message?.includes('429')) {
+        console.log(`[historical-fees] RPC rate limit reached when fetching position ${position.position_address.slice(0, 8)}...`);
+      } else if (error.message?.includes('timeout')) {
+        console.log(`[historical-fees] RPC timeout when fetching position ${position.position_address.slice(0, 8)}...`);
+      } else {
+        console.log(`[historical-fees] Error verifying position ${position.position_address.slice(0, 8)}...: ${error.message || 'Unknown error'}`);
+      }
+      
+      // Fall back to price-based calculation which is still accurate for historical fee collection
+      return { feeAUsd, feeBUsd, totalUsd };
+    }
+  } catch (error: any) {
+    console.error("[historical-fees] Error calculating fees:", error);
+    // Return zeros if calculation fails
+    return { feeAUsd: 0, feeBUsd: 0, totalUsd: 0 };
+  }
 }

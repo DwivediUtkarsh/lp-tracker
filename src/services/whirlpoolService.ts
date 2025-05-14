@@ -227,10 +227,10 @@ export async function getWhirlpoolExposures(
         const tokenAAddress = tokenAInfo.mint.toBase58();
         const tokenBAddress = tokenBInfo.mint.toBase58();
         
-        // Get token metadata
+        // Get token metadata - FIXED to pass tokenAddress as string
         const [metaA, metaB] = await Promise.all([
-          getTokenMetadata(connection, tokenAAddress),
-          getTokenMetadata(connection, tokenBAddress),
+          getTokenMetadata(tokenAAddress),
+          getTokenMetadata(tokenBAddress),
         ]);
 
         // Get symbols and decimals (with fallbacks)

@@ -22,6 +22,7 @@ import {
 } from '../db/models.js';
 import { query } from '../utils/database.js';
 import { getTokenPrices } from './priceService.js';
+import { calculateHistoricalFees } from './whirlpoolRewardsService.js';
 import * as BN from 'bn.js';
 
 // Constants for Helius API
@@ -569,14 +570,49 @@ async function processTransactions(
     // First try by position address if available
     if (parsedTx.positionAddress && positionMap[parsedTx.positionAddress]) {
       matchedPositions = [positionMap[parsedTx.positionAddress]];
+      console.log(`Matched position by address: ${parsedTx.positionAddress.slice(0, 8)}...`);
     } 
     // Then try by pool address if available
     else if (parsedTx.poolAddress && poolPositionMap[parsedTx.poolAddress]) {
       matchedPositions = poolPositionMap[parsedTx.poolAddress];
+      console.log(`Matched ${matchedPositions.length} positions by pool address: ${parsedTx.poolAddress.slice(0, 8)}...`);
     }
-    // If still no match, use any position (for demo)
+    // Try to match by token addresses if the transaction has token information
+    else if (parsedTx.tokenAmounts && (parsedTx.tokenAmounts.tokenA?.mint || parsedTx.tokenAmounts.tokenB?.mint)) {
+      console.log(`No direct match found, attempting to match by token addresses...`);
+      
+      const tokenAMint = parsedTx.tokenAmounts.tokenA?.mint;
+      const tokenBMint = parsedTx.tokenAmounts.tokenB?.mint;
+      
+      // Filter positions that contain one or both tokens
+      const possibleMatches = positions.filter(pos => {
+        const hasTokenA = tokenAMint && (pos.token_a_address === tokenAMint || pos.token_b_address === tokenAMint);
+        const hasTokenB = tokenBMint && (pos.token_a_address === tokenBMint || pos.token_b_address === tokenBMint);
+        return hasTokenA || hasTokenB;
+      });
+      
+      if (possibleMatches.length > 0) {
+        // If we found multiple matches, prefer positions that match both tokens
+        const exactMatches = possibleMatches.filter(pos => {
+          const hasTokenA = tokenAMint && (pos.token_a_address === tokenAMint || pos.token_b_address === tokenAMint);
+          const hasTokenB = tokenBMint && (pos.token_a_address === tokenBMint || pos.token_b_address === tokenBMint);
+          return hasTokenA && hasTokenB;
+        });
+        
+        if (exactMatches.length > 0) {
+          console.log(`Found ${exactMatches.length} position(s) matching both tokens`);
+          matchedPositions = exactMatches;
+        } else {
+          console.log(`Found ${possibleMatches.length} position(s) matching at least one token`);
+          matchedPositions = possibleMatches;
+        }
+      }
+    }
+    // If still no match, use first position as last resort but log a clear warning
     else if (positions.length > 0) {
-      console.log(`No position match found for tx ${tx.signature.slice(0, 8)}... - using first position as fallback`);
+      console.warn(`⚠️ WARNING: No position match found for tx ${tx.signature.slice(0, 8)}... - using first position as fallback`);
+      console.warn(`  This may lead to inaccurate data attribution!`);
+      console.warn(`  Consider manual verification for this transaction.`);
       matchedPositions = [positions[0]];
     }
     
@@ -595,31 +631,37 @@ async function processTransactions(
             position.token_b_address
           ].filter(Boolean);
           
-          const tokenPrices = await getTokenPrices(tokenAddresses);
-          const tokenAPrice = tokenPrices[position.token_a_address] || 0;
-          const tokenBPrice = tokenPrices[position.token_b_address] || 0;
+          const tokenAAmount = parsedTx.tokenAmounts.tokenA?.amount || 0;
+          const tokenBAmount = parsedTx.tokenAmounts.tokenB?.amount || 0;
           
-          // Calculate USD value of the fee
-          const feeAmountUsd = (parsedTx.tokenAmounts.tokenA?.amount || 0) * tokenAPrice + 
-                              (parsedTx.tokenAmounts.tokenB?.amount || 0) * tokenBPrice;
+          // Use the accurate fee calculation from whirlpoolRewardsService
+          const feeData = await calculateHistoricalFees(
+            {
+              position_address: position.position_address,
+              token_a_address: position.token_a_address,
+              token_b_address: position.token_b_address
+            },
+            tokenAAmount,
+            tokenBAmount
+          );
           
-          console.log(`  Token prices: ${position.token_a_symbol}=$${tokenAPrice.toFixed(4)}, ${position.token_b_symbol}=$${tokenBPrice.toFixed(4)}`);
-          console.log(`  Fee USD value: $${feeAmountUsd.toFixed(2)}`);
+          console.log(`  Token prices: ${position.token_a_symbol}=$${(feeData.feeAUsd / tokenAAmount).toFixed(4)}, ${position.token_b_symbol}=$${(feeData.feeBUsd / tokenBAmount).toFixed(4)}`);
+          console.log(`  Fee USD value: $${feeData.totalUsd.toFixed(2)}`);
           
           await recordFeeEvent({
             position_id: position.id,
             transaction_hash: tx.signature,
             timestamp: new Date(tx.timestamp * 1000),
-            token_a_amount: parsedTx.tokenAmounts.tokenA?.amount || 0,
-            token_b_amount: parsedTx.tokenAmounts.tokenB?.amount || 0,
-            token_a_price_usd: tokenAPrice,
-            token_b_price_usd: tokenBPrice,
-            fee_amount_usd: feeAmountUsd,
+            token_a_amount: tokenAAmount,
+            token_b_amount: tokenBAmount,
+            token_a_price_usd: tokenAAmount > 0 ? feeData.feeAUsd / tokenAAmount : 0,
+            token_b_price_usd: tokenBAmount > 0 ? feeData.feeBUsd / tokenBAmount : 0,
+            fee_amount_usd: feeData.totalUsd,
             block_number: tx.slot
           });
           
           console.log(`Recorded fee collection event for position ${position.position_address?.slice(0, 8)}... (ID: ${position.id})`);
-          console.log(`  Tokens: ${parsedTx.tokenAmounts.tokenA?.amount || 0} ${position.token_a_symbol}, ${parsedTx.tokenAmounts.tokenB?.amount || 0} ${position.token_b_symbol}`);
+          console.log(`  Tokens: ${tokenAAmount} ${position.token_a_symbol}, ${tokenBAmount} ${position.token_b_symbol}`);
           eventCounts.feeEvents++;
         } catch (error) {
           console.error(`Error recording fee event: ${error}`);
@@ -657,7 +699,7 @@ async function processTransactions(
             token_a_price_usd: tokenAPrice,
             token_b_price_usd: tokenBPrice,
             total_value_usd: feeAmountUsd,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          block_number: tx.slot
+            block_number: tx.slot
           });
           
           console.log(`Recorded liquidity ${parsedTx.type === TransactionType.IncreaseLiquidity ? 'increase' : 'decrease'} event for position ${position.position_address?.slice(0, 8)}... (ID: ${position.id})`);

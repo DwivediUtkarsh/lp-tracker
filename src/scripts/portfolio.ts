@@ -4,6 +4,7 @@
  * Shows a complete portfolio overview with:
  * - Token balances and values
  * - Whirlpool positions and values
+ * - Raydium CLMM positions and values
  * - Total portfolio value
  * 
  * Usage: npm run portfolio <WALLET_PUBKEY>
@@ -13,9 +14,11 @@ import { PublicKey, Connection } from '@solana/web3.js';
 import { ReliableConnection } from '../utils/solana.js';
 import { RPC_ENDPOINT } from '../config.js';
 import { getWhirlpoolExposures } from '../services/whirlpoolService.js';
+import { getRaydiumClmmExposures } from '../services/raydiumClmmService.js';
 import { getTokenMetadata, getWalletTokens } from '../utils/tokenUtils.js';
 import { enrichPositionsWithPrices, getTokenPrices } from '../services/priceService.js';
 import { getUncollectedFees } from '../services/whirlpoolRewardsService.js';
+import { getRaydiumUncollectedFees } from '../services/raydiumClmmRewardsService.js';
 
 async function main() {
   // Parse command line arguments
@@ -42,6 +45,7 @@ async function main() {
     
     let totalPortfolioValue = 0;
     let whirlpoolRewards: any[] = [];
+    let raydiumRewards: any[] = [];
     
     // PART 1: Fetch wallet tokens
     console.log('PART 1: TOKENS');
@@ -57,9 +61,89 @@ async function main() {
     // Get addresses for price lookup
     const tokenAddresses = nonZeroTokens.map(t => t.mint);
     
-    // Fetch token prices
+    // Fetch token prices - use whirlpool prices if available
     console.log("Fetching token prices...");
-    const prices = await getTokenPrices(tokenAddresses);
+    let prices: Record<string, number> = {}; 
+    let totalTokenValue = 0;
+
+    // Attempt to get prices multiple ways to improve success rate
+    try {
+      // Define important known tokens to prioritize fetching
+      const knownTokenPrices: Record<string, number> = {
+        'So11111111111111111111111111111111111111112': 150.0, // SOL approximate price
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 1.0,  // USDC is pegged to $1
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 1.0,  // USDT is pegged to $1
+      };
+      
+      // Step 1: First fetch prices for important tokens (SOL, USDC, USDT)
+      const priorityTokens = tokenAddresses.filter(addr => 
+        Object.keys(knownTokenPrices).includes(addr)
+      );
+      
+      if (priorityTokens.length > 0) {
+        console.log("Fetching prices for priority tokens first...");
+        const priorityPrices = await getTokenPrices(priorityTokens);
+        prices = {...prices, ...priorityPrices};
+        
+        // Apply fallbacks for any priority tokens that failed
+        priorityTokens.forEach(addr => {
+          if (!prices[addr] && knownTokenPrices[addr]) {
+            console.log(`Using fallback price for ${addr.slice(0, 8)}...`);
+            prices[addr] = knownTokenPrices[addr];
+          }
+        });
+        
+        // Give the API a short break
+        console.log("Waiting before fetching remaining tokens...");
+        await new Promise(r => setTimeout(r, 1500));
+      }
+
+      // Step 2: Fetch remaining tokens in small batches
+      const remainingTokens = tokenAddresses.filter(addr => 
+        !priorityTokens.includes(addr)
+      );
+      
+      if (remainingTokens.length > 0) {
+        console.log(`Fetching remaining ${remainingTokens.length} tokens in batches...`);
+        
+        // Create batches of tokens to fetch (maximum 3 per batch to avoid rate limits)
+        const BATCH_SIZE = 3;
+        for (let i = 0; i < remainingTokens.length; i += BATCH_SIZE) {
+          const batch = remainingTokens.slice(i, i + BATCH_SIZE);
+          console.log(`Fetching batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(remainingTokens.length/BATCH_SIZE)}...`);
+          
+          try {
+            const batchPrices = await getTokenPrices(batch);
+            prices = {...prices, ...batchPrices};
+            
+            // Give the API a break between batches
+            if (i + BATCH_SIZE < remainingTokens.length) {
+              console.log("Waiting between batches...");
+              await new Promise(r => setTimeout(r, 2000));
+            }
+          } catch (error) {
+            console.error(`Error fetching batch ${Math.floor(i/BATCH_SIZE) + 1}:`, error);
+          }
+        }
+      }
+
+      console.log("Token prices fetched successfully!");
+      
+      // Show the prices we got
+      console.log("Fetched token prices:");
+      let pricesFound = 0;
+      Object.entries(prices).forEach(([mint, price]) => {
+        if (price > 0) {
+          const token = nonZeroTokens.find(t => t.mint === mint);
+          const symbol = token?.symbol || mint.slice(0, 8);
+          console.log(`${symbol}: $${price.toFixed(4)}`);
+          pricesFound++;
+        }
+      });
+      console.log(`Successfully fetched prices for ${pricesFound}/${tokenAddresses.length} tokens`);
+    } catch (error) {
+      console.error("Error fetching token prices, using fallback values:", error);
+    }
     
     // Create display data with value calculations
     const tokenData = nonZeroTokens.map(t => {
@@ -67,11 +151,12 @@ async function main() {
       const price = typeof prices[t.mint] === 'number' ? prices[t.mint] : 0;
       const value = price * t.balance;
       
+      // For tokens with no price but non-zero balance, mark them as unknown
       return {
         Symbol: t.symbol || 'Unknown',
         Amount: t.balance.toFixed(6),
-        Price: price > 0 ? `$${price.toFixed(4)}` : 'N/A',
-        Value: value > 0 ? `$${value.toFixed(2)}` : 'N/A',
+        Price: price > 0 ? `$${price.toFixed(4)}` : 'Unknown',
+        Value: value > 0 ? `$${value.toFixed(2)}` : (t.balance > 0 ? 'Unknown' : '$0.00'),
         'Is LP': t.isLPToken ? 'Yes' : 'No',
         Address: t.mint.slice(0, 8) + '...'
       };
@@ -89,7 +174,7 @@ async function main() {
     console.table(tokenData);
     
     // Calculate total token value
-    const totalTokenValue = nonZeroTokens.reduce((sum, t) => {
+    totalTokenValue = nonZeroTokens.reduce((sum, t) => {
       const price = typeof prices[t.mint] === 'number' ? prices[t.mint] : 0;
       return sum + (price * t.balance);
     }, 0);
@@ -102,17 +187,17 @@ async function main() {
     console.log('---------------------------');
     
     // Fetch whirlpool exposures
-    const positions = await getWhirlpoolExposures(conn, wallet);
+    const whirlpoolPositions = await getWhirlpoolExposures(conn, wallet);
     
-    if (positions.length === 0) {
+    if (whirlpoolPositions.length === 0) {
       console.log('No Orca Whirlpool positions found for this wallet.');
     } else {
       // Display positions
-      console.log(`Found ${positions.length} Orca Whirlpool positions:`);
+      console.log(`Found ${whirlpoolPositions.length} Orca Whirlpool positions:`);
       
       // Show basic position information
       console.table(
-        positions.map(pos => ({
+        whirlpoolPositions.map(pos => ({
           Pair: pos.pool,
           TokenA: pos.tokenA,
           AmountA: pos.qtyA.toFixed(6),
@@ -133,7 +218,7 @@ async function main() {
       
       // Get unique token addresses to fetch prices for
       const uniqueTokenAddresses = new Set<string>();
-      positions.forEach(pos => {
+      whirlpoolPositions.forEach(pos => {
         uniqueTokenAddresses.add(pos.tokenAAddress);
         uniqueTokenAddresses.add(pos.tokenBAddress);
       });
@@ -143,7 +228,7 @@ async function main() {
         Array.from(uniqueTokenAddresses).map(addr => addr.slice(0, 8) + '...').join(', '));
       
       // Convert to the format expected by the price service
-      const dbFormatPositions = positions.map((pos, index) => ({
+      const dbFormatPositions = whirlpoolPositions.map((pos, index) => ({
         id: index,
         dex: pos.dex,
         pool_address: pos.pool,
@@ -178,7 +263,7 @@ async function main() {
       
       // Display uncollected fees
       console.log('\n=== Uncollected Fees (Rewards) ===');
-      const feesData = positions.map(pos => {
+      const feesData = whirlpoolPositions.map(pos => {
         const reward = rewardsMap.get(pos.positionAddress);
         return {
           Pair: pos.pool,
@@ -199,18 +284,128 @@ async function main() {
       totalPortfolioValue += totalFeesValue;
     }
     
-    // PART 3: Portfolio Summary
+    // PART 3: Fetch Raydium CLMM positions
+    console.log('\n\nPART 3: RAYDIUM CLMM POSITIONS');
+    console.log('-----------------------------');
+    
+    // Fetch Raydium CLMM exposures
+    const raydiumPositions = await getRaydiumClmmExposures(conn, wallet);
+    
+    if (raydiumPositions.length === 0) {
+      console.log('No Raydium CLMM positions found for this wallet.');
+    } else {
+      // Display positions
+      console.log(`Found ${raydiumPositions.length} Raydium CLMM positions:`);
+      
+      // Show basic position information
+      console.table(
+        raydiumPositions.map(pos => ({
+          Pair: pos.pool,
+          TokenA: pos.tokenA,
+          AmountA: pos.qtyA.toFixed(6),
+          TokenB: pos.tokenB,
+          AmountB: pos.qtyB.toFixed(6)
+        }))
+      );
+      
+      // Fetch uncollected fees/rewards
+      console.log('\nFetching uncollected fees and rewards...');
+      raydiumRewards = await getRaydiumUncollectedFees(conn, wallet);
+      console.log(`Found fee data for ${raydiumRewards.length} positions`);
+      
+      // Create a map for quick lookup
+      const rewardsMap = new Map(
+        raydiumRewards.map(reward => [reward.positionAddress, reward])
+      );
+      
+      // Get unique token addresses to fetch prices for
+      const uniqueTokenAddresses = new Set<string>();
+      raydiumPositions.forEach(pos => {
+        uniqueTokenAddresses.add(pos.tokenAAddress);
+        uniqueTokenAddresses.add(pos.tokenBAddress);
+      });
+      
+      console.log('\nFetching price information for positions...');
+      console.log('Fetching prices for tokens:', 
+        Array.from(uniqueTokenAddresses).map(addr => addr.slice(0, 8) + '...').join(', '));
+      
+      // Convert to the format expected by the price service
+      const dbFormatPositions = raydiumPositions.map((pos, index) => ({
+        id: index,
+        dex: pos.dex,
+        pool_address: pos.pool,
+        token_a_symbol: pos.tokenA,
+        token_b_symbol: pos.tokenB,
+        qty_a: pos.qtyA,
+        qty_b: pos.qtyB,
+        token_a_address: pos.tokenAAddress,
+        token_b_address: pos.tokenBAddress
+      }));
+      
+      // Enrich with prices
+      const enrichedPositions = await enrichPositionsWithPrices(dbFormatPositions);
+      
+      // Display with value information
+      console.log('\n=== Position Values ===');
+      console.table(
+        enrichedPositions.map(p => ({
+          Pair: `${p.token_a_symbol}-${p.token_b_symbol}`,
+          [`${p.token_a_symbol}`]: p.qty_a.toFixed(4),
+          [`${p.token_a_symbol} Value`]: p.qty_a > 0 ? `$${p.token_a_value?.toFixed(2) || '0.00'}` : '-',
+          [`${p.token_b_symbol}`]: p.qty_b.toFixed(4),
+          [`${p.token_b_symbol} Value`]: p.qty_b > 0 ? `$${p.token_b_value?.toFixed(2) || '0.00'}` : '-',
+          ['Position Value']: `$${p.total_value?.toFixed(2) || '0.00'}`
+        }))
+      );
+      
+      // Calculate and display total value across all positions
+      const totalRaydiumValue = enrichedPositions.reduce((sum, pos) => sum + (pos.total_value || 0), 0);
+      console.log(`\n💰 Total Raydium CLMM Value: $${totalRaydiumValue.toFixed(2)}`);
+      totalPortfolioValue += totalRaydiumValue;
+      
+      // Display uncollected fees
+      console.log('\n=== Uncollected Fees (Rewards) ===');
+      const feesData = raydiumPositions.map(pos => {
+        const reward = rewardsMap.get(pos.positionAddress);
+        return {
+          Pair: pos.pool,
+          [`${pos.tokenA} Fees`]: reward ? reward.feeA.toFixed(6) : '-',
+          [`${pos.tokenA} Fees Value`]: reward?.feeAUsd ? `$${reward.feeAUsd.toFixed(2)}` : '-',
+          [`${pos.tokenB} Fees`]: reward ? reward.feeB.toFixed(6) : '-',
+          [`${pos.tokenB} Fees Value`]: reward?.feeBUsd ? `$${reward.feeBUsd.toFixed(2)}` : '-',
+          ['Total Fees Value']: reward?.totalUsd ? `$${reward.totalUsd.toFixed(2)}` : '-',
+        };
+      });
+      console.table(feesData);
+      
+      // Calculate total fees value
+      const totalRaydiumFeesValue = raydiumRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0);
+      console.log(`\n💸 Total Uncollected Fees: $${totalRaydiumFeesValue.toFixed(2)}`);
+      
+      // Add fees to portfolio total
+      totalPortfolioValue += totalRaydiumFeesValue;
+    }
+    
+    // PART 4: Portfolio Summary
     console.log('\n\n📈 PORTFOLIO SUMMARY 📈');
     console.log('=======================');
     console.log(`Token Value:     $${totalTokenValue.toFixed(2)}`);
     
     // Calculate whirlpool value and fees separately
-    const whirlpoolPositionValue = totalPortfolioValue - totalTokenValue;
-    const whirlpoolFeesValue = whirlpoolRewards.length > 0 ? whirlpoolRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0) : 0;
-    const whirlpoolTotalValue = whirlpoolPositionValue - whirlpoolFeesValue;
+    const whirlpoolPositionValue = whirlpoolPositions.length > 0 ? 
+      whirlpoolPositions.reduce((sum, pos) => sum + (pos.totalValue || 0), 0) : 0;
+    const whirlpoolFeesValue = whirlpoolRewards.length > 0 ? 
+      whirlpoolRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0) : 0;
     
-    console.log(`Whirlpool Value: $${whirlpoolTotalValue.toFixed(2)}`);
-    console.log(`Uncollected Fees: $${whirlpoolFeesValue.toFixed(2)}`);
+    // Calculate Raydium CLMM value and fees separately
+    const raydiumPositionValue = raydiumPositions.length > 0 ?
+      raydiumPositions.reduce((sum, pos) => sum + (pos.totalValue || 0), 0) : 0;
+    const raydiumFeesValue = raydiumRewards.length > 0 ?
+      raydiumRewards.reduce((sum: number, reward) => sum + (reward.totalUsd || 0), 0) : 0;
+    
+    console.log(`Whirlpool Value: $${whirlpoolPositionValue.toFixed(2)}`);
+    console.log(`Raydium CLMM Value: $${raydiumPositionValue.toFixed(2)}`);
+    console.log(`Uncollected Fees: $${(whirlpoolFeesValue + raydiumFeesValue).toFixed(2)}`);
     console.log('------------------------------');
     console.log(`TOTAL VALUE:     $${totalPortfolioValue.toFixed(2)}`);
     

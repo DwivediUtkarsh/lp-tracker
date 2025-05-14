@@ -28,7 +28,7 @@ export interface TokenInfo {
   decimals: number;
   symbol: string;
   name: string;
-  metadata: TokenMetadata;
+  metadata: TokenMetadata | null;
   isLPToken?: boolean;
   [key: string]: any;
 }
@@ -166,63 +166,82 @@ async function fetchOnchainMetadata(connection: Connection, mintAddress: string)
 }
 
 /**
- * Consolidated metadata fetch logic
+ * Get token metadata from various sources
+ * 
+ * This function tries multiple sources to get token metadata:
+ * 1. Local cache
+ * 2. On-chain metadata
+ * 3. Helius API (if available)
+ * 
+ * @param tokenAddress Token mint address
+ * @returns Token metadata object or null if not found
  */
-export async function getTokenMetadata(
-  connection: Connection,
-  mintAddress: string
-): Promise<TokenMetadata> {
-  console.log(`Fetching metadata for token: ${mintAddress}`);
+export async function getTokenMetadata(tokenAddress: string): Promise<TokenMetadata | null> {
+  if (!tokenAddress) {
+    console.log("No token address provided to getTokenMetadata");
+    return null;
+  }
   
-  // 1. Cache
-  if (tokenMetadataCache.has(mintAddress)) {
-    console.log(`Using cached metadata for ${mintAddress}`);
-    return tokenMetadataCache.get(mintAddress)!;
+  try {
+    // Check if we have it in cache
+    const cachedMetadata = tokenMetadataCache.get(tokenAddress);
+    if (cachedMetadata) {
+      console.log(`Using cached metadata for ${tokenAddress}`);
+      return cachedMetadata;
   }
 
-  // 2. Registry
-  await preloadTokenRegistry();
-  if (tokenMetadataCache.has(mintAddress)) {
-    const md = tokenMetadataCache.get(mintAddress)!;
-    console.log(`Found registry metadata for ${mintAddress}: ${md.symbol}`);
-    tokenMetadataCache.set(mintAddress, md);
-    return md;
+    // Try to get from Helius API first (if API key is available)
+    if (process.env.HELIUS_API_KEY) {
+      try {
+        console.log(`Fetching Helius metadata for ${tokenAddress}...`);
+        const heliusMetadata = await fetchHeliusMetadata(tokenAddress);
+        if (heliusMetadata) {
+          // Cache and return
+          tokenMetadataCache.set(tokenAddress, heliusMetadata);
+          return heliusMetadata;
+        }
+      } catch (error: any) {
+        console.log(`Helius metadata fetch failed for ${tokenAddress}: ${error.message}`);
+      }
+    }
+    
+    // Try to get on-chain metadata
+    try {
+      console.log(`Fetching on-chain metadata for ${tokenAddress}...`);
+      // Create a connection for on-chain metadata
+      const connection = new Connection(process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com');
+      const onChainMetadata = await fetchOnchainMetadata(connection, tokenAddress);
+      if (onChainMetadata) {
+        console.log(`Found on-chain metadata for ${tokenAddress}: ${onChainMetadata.symbol}`);
+        // Cache and return
+        tokenMetadataCache.set(tokenAddress, onChainMetadata);
+        return onChainMetadata;
   }
-
-  // 3. Jupiter
-  await preloadJupiterTokens();
-  if (tokenMetadataCache.has(mintAddress)) {
-    const md = tokenMetadataCache.get(mintAddress)!;
-    console.log(`Found Jupiter metadata for ${mintAddress}: ${md.symbol}`);
-    tokenMetadataCache.set(mintAddress, md);
-    return md;
-  }
-
-  // 4. Helius
-  const heliusMd = await fetchHeliusMetadata(mintAddress);
-  if (heliusMd) {
-    tokenMetadataCache.set(mintAddress, heliusMd);
-    return heliusMd;
-  }
-
-  // 5. On-chain Metaplex
-  const onchainMd = await fetchOnchainMetadata(connection, mintAddress);
-  if (onchainMd) {
-    tokenMetadataCache.set(mintAddress, onchainMd);
-    return onchainMd;
-  }
-
-  // 6. Fallback default
-  console.log(`No metadata found for ${mintAddress}, using default`);
-  const defaultMd: TokenMetadata = {
-    address: mintAddress,
-    symbol: mintAddress.slice(0, 4),
-    name: `Unknown (${mintAddress.slice(0, 8)}...)`,
-    decimals: 0,
-    logoURI: null
+    } catch (error: any) {
+      console.log(`On-chain metadata fetch failed for ${tokenAddress}: ${error.message}`);
+    }
+    
+    // If we get here, we couldn't find metadata
+    console.log(`No metadata found for ${tokenAddress}, using default`);
+    
+    // Create a minimal metadata object with just the address
+    const minimalMetadata: TokenMetadata = {
+      address: tokenAddress,
+      symbol: tokenAddress.slice(0, 6),
+      name: tokenAddress.slice(0, 6),
+      decimals: 9, // Default to 9 decimals (SOL standard)
+      logoURI: null,
+      tags: []
   };
-  tokenMetadataCache.set(mintAddress, defaultMd);
-  return defaultMd;
+    
+    // Cache this minimal metadata
+    tokenMetadataCache.set(tokenAddress, minimalMetadata);
+    return minimalMetadata;
+    
+  } catch (error: any) {
+    console.error(`Error in getTokenMetadata for ${tokenAddress}:`, error);
+    return null;
+  }
 }
 
 /**
@@ -267,8 +286,8 @@ async function processTokenBatch(
       
       console.log(`Processing token ${startIndex + index + 1}/${accounts.length}: ${mint}`);
 
-      const metadata = await getTokenMetadata(connection, mint);
-      console.log(`Retrieved metadata for ${mint}: ${metadata.symbol}`);
+      const metadata = await getTokenMetadata(mint);
+      console.log(`Retrieved metadata for ${mint}: ${metadata?.symbol}`);
       
       const tokenInfo: TokenInfo = {
         mint,
@@ -276,13 +295,13 @@ async function processTokenBatch(
         address_label: acc.pubkey.toString(),
         balance,
         decimals,
-        symbol: metadata.symbol,
-        name: metadata.name,
+        symbol: metadata?.symbol || mint.slice(0, 6),
+        name: metadata?.name || mint.slice(0, 6),
         metadata
       };
       
       // Check if it's likely an LP token
-      console.log(`Checking if ${metadata.symbol} is an LP token...`);
+      console.log(`Checking if ${metadata?.symbol} is an LP token...`);
       const isLP = isLikelyLPToken(tokenInfo);
       
       return {

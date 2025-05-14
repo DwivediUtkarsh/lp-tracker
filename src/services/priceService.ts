@@ -80,82 +80,118 @@ export async function getTokenPrice(tokenMint: string): Promise<number> {
  * 2. Only fetching prices for tokens not in cache or with expired cache
  * 3. Falling back to expired cache values if API call fails
  * 
- * @param tokenMints - Array of token mint addresses
+ * @param mints - Array of token mint addresses
  * @returns Object mapping token mint addresses to their USD prices
  */
-export async function getTokenPrices(tokenMints: string[]): Promise<Record<string, number>> {
-  if (tokenMints.length === 0) {
+export async function getTokenPrices(mints: string[]): Promise<Record<string, number>> {
+  if (mints.length === 0) {
     return {};
   }
 
-  const prices: Record<string, number> = {};
-  
-  // Check which tokens need price updates
-  const now = Date.now();
-  const mintsToFetch = tokenMints.filter(mint => 
-    !priceCache[mint] || now - priceCache[mint].timestamp >= CACHE_TTL
-  );
-  
-  if (mintsToFetch.length > 0) {
-    try {
-      // Jupiter allows fetching multiple prices in one call
-      const response = await axios.get(
-        `https://api.jup.ag/price/v2?ids=${mintsToFetch.join(',')}`,
-        { 
-          timeout: 5000,
-          headers: {
+  try {
+    // Try Jupiter first
+    const { data: jupiterData } = await axios.get(
+      'https://api.jup.ag/price/v2', 
+      { 
+        params: { ids: mints.join(',') }, 
+        timeout: 10_000, // Increased timeout as per guide
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'LP-Tracker/1.0' // Keep existing User-Agent
+        }
+      }
+    );
+    // Ensure prices are numbers
+    const prices: Record<string, number> = {};
+    for (const k in jupiterData.data) {
+      if (jupiterData.data[k] && typeof jupiterData.data[k].price !== 'undefined') {
+        prices[k] = Number(jupiterData.data[k].price);
+      }
+    }
+    // Check if we got prices for all requested mints
+    // If not, it doesn't necessarily mean an error for the whole call,
+    // Jupiter might just not track some mints.
+    // The fallback will handle missing ones.
+    
+    // We need to identify which mints were NOT found by Jupiter to try Raydium for them.
+    const foundMints = Object.keys(prices);
+    const missingMints = mints.filter(m => !foundMints.includes(m));
+
+    if (missingMints.length > 0) {
+      try {
+        const { data: raydiumData } = await axios.get('https://api.raydium.io/v2/main/price', {
+          timeout: 10_000, // Add timeout for consistency
+           headers: {
             'Accept': 'application/json',
             'User-Agent': 'LP-Tracker/1.0'
           }
-        }
-      );
-      
-      // Update cache and prices object
-      mintsToFetch.forEach(mint => {
-        try {
-          if (response.data.data && response.data.data[mint] && response.data.data[mint].price) {
-            // Convert price to number if it's a string
-            const priceValue = response.data.data[mint].price;
-            const price = typeof priceValue === 'string' ? parseFloat(priceValue) : priceValue;
-            
-            priceCache[mint] = { price, timestamp: now };
-            prices[mint] = price;
-          } else {
-            console.warn(`No valid price data for ${mint}`);
-            prices[mint] = 0;
+        });
+        missingMints.forEach(m => {
+          if (raydiumData[m]) {
+            prices[m] = Number(raydiumData[m]);
           }
-        } catch (e) {
-          console.warn(`Error processing price for ${mint}:`, e);
-          prices[mint] = 0;
-        }
-      });
-    } catch (error) {
-      console.error('Error fetching multiple token prices:', error);
-      
-      // Use expired cached prices if available
-      mintsToFetch.forEach(mint => {
-        if (priceCache[mint] && typeof priceCache[mint].price === 'number') {
-          prices[mint] = priceCache[mint].price;
-          console.log(`Using expired cached price for ${mint}`);
-        } else {
-          prices[mint] = 0;
-        }
-      });
-    }
-  }
-  
-  // Add cached prices
-  tokenMints.forEach(mint => {
-    if (!prices[mint]) {
-      if (priceCache[mint] && typeof priceCache[mint].price === 'number') {
-        prices[mint] = priceCache[mint].price;
-      } else {
-        prices[mint] = 0;
+        });
+      } catch (raydiumError) {
+        // Log Raydium specific error but don't let it stop processing
+        console.warn(`[priceService] Raydium fallback failed for some mints: ${missingMints.join(',')}`, raydiumError);
       }
     }
-  });
-  
-  return prices;
+    
+    // For any mints still without a price, set to 0 and update cache.
+    // Also, update cache for successfully fetched prices.
+    const finalPrices: Record<string, number> = {};
+    const now = Date.now();
+    mints.forEach(m => {
+      if (typeof prices[m] === 'number') {
+        finalPrices[m] = prices[m];
+        priceCache[m] = { price: prices[m], timestamp: now };
+      } else {
+        finalPrices[m] = 0; // Default to 0 if not found by either
+        // Optionally, could use old cache here if preferred:
+        // if (priceCache[m]) finalPrices[m] = priceCache[m].price; else finalPrices[m] = 0;
+        // For simplicity aligning with guide, just 0 if not found in this round.
+      }
+    });
+
+    return finalPrices;
+
+  } catch (e) {
+    // This 'e' is from Jupiter failing. Now try Raydium for ALL mints.
+    console.warn('[priceService] Jupiter API failed, attempting fallback to Raydium for all mints:', mints.join(','), e);
+    try {
+      const { data: raydiumFallbackData } = await axios.get('https://api.raydium.io/v2/main/price', {
+        timeout: 10_000,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'LP-Tracker/1.0'
+        }
+      });
+      const prices: Record<string, number> = {};
+      const now = Date.now();
+      let allFoundInRaydium = true;
+      mints.forEach(m => {
+        if (raydiumFallbackData[m]) {
+          prices[m] = Number(raydiumFallbackData[m]);
+          priceCache[m] = { price: prices[m], timestamp: now };
+        } else {
+          prices[m] = 0; // Not found in Raydium fallback
+          allFoundInRaydium = false;
+        }
+      });
+      if (!allFoundInRaydium) {
+         console.warn('[priceService] Some mints not found in Raydium fallback:', mints.filter(m => !prices[m]).join(','));
+      }
+      if (Object.keys(prices).length > 0) return prices; // Return if Raydium found anything
+    } catch (raydiumError) {
+       console.warn('[priceService] Raydium fallback API also failed:', raydiumError);
+    }
+
+    // If both Jupiter and the Raydium fallback failed for all mints, log once and return 0s.
+    console.warn('[priceService] All price sources failed for mints:', mints.join(','));
+    const finalPrices: Record<string, number> = {};
+    mints.forEach(m => finalPrices[m] = 0);
+    return finalPrices;
+  }
 }
 
 /**

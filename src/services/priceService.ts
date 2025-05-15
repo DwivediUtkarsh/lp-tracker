@@ -102,7 +102,7 @@ export async function getTokenPrices(mints: string[]): Promise<Record<string, nu
       }
     );
     // Ensure prices are numbers
-    const prices: Record<string, number> = {};
+  const prices: Record<string, number> = {};
     for (const k in jupiterData.data) {
       if (jupiterData.data[k] && typeof jupiterData.data[k].price !== 'undefined') {
         prices[k] = Number(jupiterData.data[k].price);
@@ -116,12 +116,12 @@ export async function getTokenPrices(mints: string[]): Promise<Record<string, nu
     // We need to identify which mints were NOT found by Jupiter to try Raydium for them.
     const foundMints = Object.keys(prices);
     const missingMints = mints.filter(m => !foundMints.includes(m));
-
+  
     if (missingMints.length > 0) {
-      try {
+    try {
         const { data: raydiumData } = await axios.get('https://api.raydium.io/v2/main/price', {
           timeout: 10_000, // Add timeout for consistency
-           headers: {
+          headers: {
             'Accept': 'application/json',
             'User-Agent': 'LP-Tracker/1.0'
           }
@@ -145,7 +145,7 @@ export async function getTokenPrices(mints: string[]): Promise<Record<string, nu
       if (typeof prices[m] === 'number') {
         finalPrices[m] = prices[m];
         priceCache[m] = { price: prices[m], timestamp: now };
-      } else {
+          } else {
         finalPrices[m] = 0; // Default to 0 if not found by either
         // Optionally, could use old cache here if preferred:
         // if (priceCache[m]) finalPrices[m] = priceCache[m].price; else finalPrices[m] = 0;
@@ -155,7 +155,7 @@ export async function getTokenPrices(mints: string[]): Promise<Record<string, nu
 
     return finalPrices;
 
-  } catch (e) {
+        } catch (e) {
     // This 'e' is from Jupiter failing. Now try Raydium for ALL mints.
     console.warn('[priceService] Jupiter API failed, attempting fallback to Raydium for all mints:', mints.join(','), e);
     try {

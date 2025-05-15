@@ -10,45 +10,17 @@ import axios from 'axios';
 import { getTokenMetadata } from '../utils/tokenUtils.js';
 import { getTokenPrices } from './priceService.js';
 import { Exposure } from '../types/Exposure.js';
-import { getClmmProgram } from './raydiumIdl.js';
+import { 
+  getClmmProgram, 
+  RAYDIUM_CLMM_PROGRAM_ID, 
+  safeDecodePosition, 
+  safeDecodePool
+} from './raydiumIdl.js';
 
-// Raydium CLMM Program ID
-const RAYDIUM_CLMM_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
+// Helius API endpoint
 const HELIUS_API_ENDPOINT = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ''}`;
 
-// Type definitions
-interface RaydiumPositionInfo {
-  nftMint: PublicKey;
-  poolId: PublicKey;
-  tickLowerIndex: number;
-  tickUpperIndex: number;
-  liquidity: BN;
-  tokenFeesOwed0: BN;
-  tokenFeesOwed1: BN;
-}
-
-interface RaydiumPoolInfo {
-  tokenMint0: PublicKey;
-  tokenMint1: PublicKey;
-  mintDecimals0: number;
-  mintDecimals1: number;
-  tickCurrent: number;
-  sqrtPriceX64: BN;
-}
-
-// Add interface for the position info with a positionAccount field
-interface RaydiumHeliusPositionInfo {
-  nftMint: PublicKey;
-  positionPda: PublicKey;
-  poolId: PublicKey;
-  tickLowerIndex: number;
-  tickUpperIndex: number;
-  liquidity: BN;
-  tokenFeesOwed0: BN;
-  tokenFeesOwed1: BN;
-}
-
-// Add a delay function
+// Add delay function
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
@@ -58,7 +30,7 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
   console.log(`[raydium-clmm] scanning for positions owned by ${walletAddress}`);
   
   try {
-    // Strategy #3: Use Helius RPC to get all NFTs for the wallet
+    // Use Helius RPC to get all NFTs for the wallet
     const connection = new Connection(HELIUS_API_ENDPOINT);
     
     // Get all NFT token accounts owned by this wallet
@@ -83,11 +55,8 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
     const nfts = response.data.result.items;
     console.log(`[raydium-clmm] found ${nfts.length} NFTs total`);
     
-    // Initialize Anchor coder
-    const coder = getClmmProgram(connection).coder;
-    
-    // Filter for Raydium position NFTs - check each NFT
-    const positionInfos: RaydiumHeliusPositionInfo[] = [];
+    // Filter for Raydium position NFTs
+    const positionInfos: any[] = [];
     
     // Process in small batches to avoid rate limiting
     const batchSize = 1;  // Process just 1 NFT at a time
@@ -109,6 +78,14 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
           // Fetch the position data
           const positionAccount = await connection.getAccountInfo(positionPDA);
           
+          // Handle rate limiting
+          if (response.status === 429) {
+            const retryAfter = Number(response.headers['retry-after'] || '1000');
+            console.log(`[raydium-helius] Rate limited. Retry after ${retryAfter}ms`);
+            await delay(retryAfter);
+            continue;
+          }
+          
           // Add a small delay after each RPC call
           await delay(100);
           
@@ -116,27 +93,13 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
           if (positionAccount && positionAccount.owner.equals(RAYDIUM_CLMM_PROGRAM_ID)) {
             console.log(`[raydium-clmm] found Raydium position NFT: ${mintAddress}`);
             
-            // Use Anchor coder to decode the position data
-            const position = coder.accounts.decode('PersonalPositionState', positionAccount.data);
-
-            // Log the decoded values
-            console.log(`[raydium-helius-debug] Decoded for NFT ${mintAddress}:`);
-            console.log(`[raydium-helius-debug]   poolId: ${position.poolId.toString()}`);
-            console.log(`[raydium-helius-debug]   tickLowerIndex: ${position.tickLowerIndex}`);
-            console.log(`[raydium-helius-debug]   tickUpperIndex: ${position.tickUpperIndex}`);
-            console.log(`[raydium-helius-debug]   liquidity: ${position.liquidity.toString()}`);
-            console.log(`[raydium-helius-debug]   feeGrowthInside0LastX64: ${position.feeGrowthInside0LastX64.toString()}`);
-            console.log(`[raydium-helius-debug]   tokenFeesOwed0: ${position.tokenFeesOwed0.toString()}`);
-
+            // Use proper decoding using the accurate IDL
+            const position = safeDecodePosition(positionAccount.data);
+            
             positionInfos.push({
               nftMint: new PublicKey(mintAddress),
               positionPda: positionPDA,
-              poolId: position.poolId,
-              tickLowerIndex: position.tickLowerIndex,
-              tickUpperIndex: position.tickUpperIndex,
-              liquidity: position.liquidity,
-              tokenFeesOwed0: position.tokenFeesOwed0,
-              tokenFeesOwed1: position.tokenFeesOwed1
+              ...position
             });
           }
         } catch (err) {
@@ -160,7 +123,7 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
     const poolIds = [...new Set(positionInfos.map(p => p.poolId.toString()))];
     console.log(`[raydium-clmm] fetching data for ${poolIds.length} unique pools`);
     
-    const poolInfoMap = new Map<string, RaydiumPoolInfo>();
+    const poolInfoMap = new Map<string, any>();
     
     // Process pools one at a time with delays
     for (const poolId of poolIds) {
@@ -171,16 +134,17 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
         await delay(100);
         
         if (poolAccount) {
-          // Use Anchor coder to decode pool data
-          const pool = coder.accounts.decode('PoolState', poolAccount.data);
+          // Use proper decoding with the actual IDL
+          const pool = safeDecodePool(poolAccount.data);
+          
+          // Safety check for decimals - use 9 as fallback only if needed
+          const decimals0 = (pool.mintDecimals0 ?? 0) > 0 ? pool.mintDecimals0 : 9;
+          const decimals1 = (pool.mintDecimals1 ?? 0) > 0 ? pool.mintDecimals1 : 9;
           
           poolInfoMap.set(poolId, {
-            tokenMint0: pool.tokenMint0,
-            tokenMint1: pool.tokenMint1,
-            mintDecimals0: pool.mintDecimals0,
-            mintDecimals1: pool.mintDecimals1,
-            tickCurrent: pool.tickCurrent,
-            sqrtPriceX64: pool.sqrtPriceX64
+            ...pool,
+            mintDecimals0: decimals0,
+            mintDecimals1: decimals1
           });
         }
       } catch (err) {
@@ -191,7 +155,7 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
       await delay(200);
     }
     
-    // NEW: Collect all involved token mints for fetching prices and metadata
+    // Collect all token mints for fetching prices and metadata
     const allTokenMints = new Set<string>();
     positionInfos.forEach(pos => {
       const poolInfo = poolInfoMap.get(pos.poolId.toString());
@@ -218,17 +182,12 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
     for (const position of positionInfos) {
       const poolInfo = poolInfoMap.get(position.poolId.toString());
       if (!poolInfo) {
-        console.warn(`[raydium-helius] Pool info not found for poolId ${position.poolId.toString()} when creating exposure for NFT ${position.nftMint.toString()}`);
+        console.warn(`[raydium-helius] Pool info not found for poolId ${position.poolId.toString()}`);
         continue; // Skip if no pool info
       }
 
-      // Log poolInfo details
-      console.log(`[raydium-helius-debug] Using PoolInfo for pool ${position.poolId.toString()}:`);
-      console.log(`[raydium-helius-debug]   tickCurrent: ${poolInfo.tickCurrent}`);
-      console.log(`[raydium-helius-debug]   sqrtPriceX64: ${poolInfo.sqrtPriceX64.toString()}`);
-      console.log(`[raydium-helius-debug]   mintDecimals0: ${poolInfo.mintDecimals0}`);
-      console.log(`[raydium-helius-debug]   mintDecimals1: ${poolInfo.mintDecimals1}`);
-
+      // Use BN for all calculations with large numbers
+      // Only convert to Decimal when doing math operations
       const { amountA, amountB } = calculateAmountsFromLiquidity(
         position.liquidity,
         poolInfo.sqrtPriceX64,
@@ -239,8 +198,14 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
         poolInfo.mintDecimals1
       );
 
-      const feesA = Number(new Decimal(position.tokenFeesOwed0.toString()).div(new Decimal(10).pow(poolInfo.mintDecimals0)));
-      const feesB = Number(new Decimal(position.tokenFeesOwed1.toString()).div(new Decimal(10).pow(poolInfo.mintDecimals1)));
+      // Use BN for fee calculations
+      const feesA = new Decimal(position.tokenFeesOwed0.toString())
+        .div(new Decimal(10).pow(poolInfo.mintDecimals0))
+        .toNumber();
+        
+      const feesB = new Decimal(position.tokenFeesOwed1.toString())
+        .div(new Decimal(10).pow(poolInfo.mintDecimals1))
+        .toNumber();
 
       const tokenAAddress = poolInfo.tokenMint0.toString();
       const tokenBAddress = poolInfo.tokenMint1.toString();
@@ -255,15 +220,11 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
 
       const tokenAValue = amountA * tokenAPrice;
       const tokenBValue = amountB * tokenBPrice;
-      const totalValue = tokenAValue + tokenBValue; // Value of current liquidity
+      const totalValue = tokenAValue + tokenBValue;
 
-      const inRange = poolInfo.tickCurrent >= position.tickLowerIndex && poolInfo.tickCurrent < position.tickUpperIndex;
-
-      const decimalsA = (poolInfo.mintDecimals0 !== undefined && poolInfo.mintDecimals0 >= 0 && poolInfo.mintDecimals0 <= 100) ? poolInfo.mintDecimals0 : 6;
-      const decimalsB = (poolInfo.mintDecimals1 !== undefined && poolInfo.mintDecimals1 >= 0 && poolInfo.mintDecimals1 <= 100) ? poolInfo.mintDecimals1 : 6;
-
-      console.log(`[raydium-helius] Position NFT ${position.nftMint?.toString().slice(0, 8) || 'unknown'}...  pool ${tokenASymbol}-${tokenBSymbol}`);
-      console.log(`[raydium-helius] Position in-range: ${inRange}   amountA: ${amountA.toFixed(decimalsA)} ${tokenASymbol}   amountB: ${amountB.toFixed(decimalsB)} ${tokenBSymbol}`);
+      // Correctly check if position is in range using the proper fields and byte order
+      const inRange = poolInfo.tickCurrent >= position.tickLowerIndex && 
+                     poolInfo.tickCurrent < position.tickUpperIndex;
 
       exposures.push({
         dex: 'raydium-clmm',
@@ -271,7 +232,7 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
         positionAddress: position.positionPda.toString(),
         tokenA: tokenASymbol,
         tokenB: tokenBSymbol,
-        qtyA: amountA, // Just current liquidity, not including fees here for base qty
+        qtyA: amountA,
         qtyB: amountB,
         tokenAAddress,
         tokenBAddress,
@@ -284,11 +245,11 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
         tickUpperIndex: position.tickUpperIndex,
         tickCurrentIndex: poolInfo.tickCurrent,
         liquidity: position.liquidity.toString(),
-        feesOwed0: feesA.toString(), // feesA is already decimal adjusted
-        feesOwed1: feesB.toString(), // feesB is already decimal adjusted
+        feesOwed0: feesA.toString(),
+        feesOwed1: feesB.toString(),
         platform: 'Raydium CLMM',
         protocolVersion: 'v2',
-        positionId: position.nftMint.toString(), // Using NFT mint as positionId
+        positionId: position.nftMint.toString(),
         nftMint: position.nftMint.toString(),
         poolId: position.poolId.toString(),
         poolName: `${tokenASymbol}-${tokenBSymbol}`,
@@ -297,7 +258,6 @@ export async function getRaydiumPositions(walletAddress: string): Promise<Exposu
       });
     }
 
-    console.log(`[raydium-helius] Processed ${exposures.length} exposures.`);
     return exposures;
 
   } catch (error) {

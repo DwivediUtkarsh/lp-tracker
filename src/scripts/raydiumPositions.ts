@@ -9,7 +9,6 @@ import dotenv from 'dotenv';
 import { Decimal } from 'decimal.js';
 
 import { ReliableConnection } from '../utils/solana.js';
-import { getRaydiumClmmExposures } from '../services/raydiumClmmService.js';
 import { getRaydiumPositions } from '../services/raydiumHeliusService.js';
 
 // Load environment config
@@ -39,25 +38,8 @@ async function main() {
   try {
     console.log('Fetching Raydium CLMM positions...');
     
-    // Try both implementations and use whichever returns results
-    let positions = [];
-    
-    try {
-      // Try the Helius DAS implementation first
-      console.log('Trying Helius DAS implementation...');
-      positions = await getRaydiumPositions(walletAddress);
-      
-      if (positions.length > 0) {
-        console.log(`Found ${positions.length} positions via Helius DAS`);
-      } else {
-        // Fall back to the original implementation
-        console.log('No positions found via Helius DAS, trying original implementation...');
-        positions = await getRaydiumClmmExposures(conn, wallet);
-      }
-    } catch (e) {
-      console.log('Error with Helius DAS implementation, trying original implementation...');
-      positions = await getRaydiumClmmExposures(conn, wallet);
-    }
+    // Use the improved Helius implementation
+    const positions = await getRaydiumPositions(walletAddress);
     
     if (positions.length === 0) {
       console.log('No Raydium CLMM positions found for this wallet.');
@@ -113,10 +95,15 @@ async function main() {
       })
     );
     
-    // Calculate and display total value across all positions (liquidity only, as per original pos.totalValue)
+    // Calculate and display total value across all positions
     const totalPortfolioValueLiquidityOnly = positions.reduce((sum, pos) => {
-      // pos.totalValue should be a number already, calculated in the service layer from Decimals
-      return sum + (Number(pos.totalValue) || 0);
+      // Calculate from individual token values
+      const qtyA_D = new Decimal(pos.qtyA || 0);
+      const qtyB_D = new Decimal(pos.qtyB || 0);
+      const tokenAPrice = pos.tokenAPrice || 0;
+      const tokenBPrice = pos.tokenBPrice || 0;
+      
+      return sum + qtyA_D.mul(tokenAPrice).toNumber() + qtyB_D.mul(tokenBPrice).toNumber();
     }, 0);
     console.log(`\n💰 Total Portfolio Value (Liquidity Only): $${totalPortfolioValueLiquidityOnly.toFixed(2)}`);
       

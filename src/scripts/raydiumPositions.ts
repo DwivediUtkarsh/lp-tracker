@@ -10,6 +10,7 @@ import { Decimal } from 'decimal.js';
 
 import { ReliableConnection } from '../utils/solana.js';
 import { getRaydiumPositions } from '../services/raydiumHeliusService.js';
+import { getRaydiumUncollectedFees } from '../services/raydiumFeeCalc.js';
 
 // Load environment config
 console.log('Loading environment config...');
@@ -60,7 +61,8 @@ async function main() {
           AmountA: qtyA_D.toFixed(8),
           TokenB: pos.tokenB,
           AmountB: qtyB_D.toFixed(8),
-          InRange: pos.inRange ? '✓' : '✗'
+          InRange: pos.inRange ? '✓' : '✗',
+          PositionID: pos.positionId?.slice(0, 8) + '...' || 'N/A'
         };
       })
     );
@@ -106,43 +108,84 @@ async function main() {
       return sum + qtyA_D.mul(tokenAPrice).toNumber() + qtyB_D.mul(tokenBPrice).toNumber();
     }, 0);
     console.log(`\n💰 Total Portfolio Value (Liquidity Only): $${totalPortfolioValueLiquidityOnly.toFixed(2)}`);
+    
+    // Fetch and display uncollected fees using the new accurate calculator
+    console.log('\n=== Calculating Uncollected Fees (Using Uniswap V3 Fee Math) ===');
+    console.log('This may take a moment as we fetch on-chain data...');
+    
+    // Debug: Log info about positions to help with tracing
+    console.log('\nPosition IDs we need to match:');
+    positions.forEach(pos => {
+      console.log(`- ${pos.positionId || 'undefined'} (pool: ${pos.pool})`);
+    });
+    
+    // Pass the already fetched positions to avoid fetching them again
+    const fees = await getRaydiumUncollectedFees(conn, wallet, positions);
+    
+    // Debug: Show the fee results we got back
+    if (fees.length > 0) {
+      console.log('\nPosition IDs from fee calculation:');
+      fees.forEach(fee => {
+        console.log(`- ${fee.positionAddress} (pool: ${fee.poolAddress})`);
+      });
+    }
+    
+    if (fees.length === 0) {
+      console.log('No uncollected fees found or calculation failed.');
+    } else {
+      console.log(`Found fee data for ${fees.length} positions.`);
       
-    // Display uncollected fees
-    console.log('\n=== Uncollected Fees ===');
-    console.table(
-      positions.map(pos => {
-        const feesA_D = new Decimal(pos.feesOwed0 || 0);
-        const feesB_D = new Decimal(pos.feesOwed1 || 0);
-        const tokenAPrice = pos.tokenAPrice || 0;
-        const tokenBPrice = pos.tokenBPrice || 0;
-
-        const feesAValue = feesA_D.mul(tokenAPrice).toNumber();
-        const feesBValue = feesB_D.mul(tokenBPrice).toNumber();
-        const totalFeesValueForRow = feesAValue + feesBValue;
-        
-        return {
-          Pair: pos.pool,
-          [`${pos.tokenA} Fees`]: feesA_D.toFixed(8), 
-          [`${pos.tokenA} Fees Value`]: tokenAPrice !== 0 && feesAValue > 0 ? `$${feesAValue.toFixed(2)}` : (tokenAPrice === 0 ? 'N/A' : '$0.00'),
-          [`${pos.tokenB} Fees`]: feesB_D.toFixed(8),
-          [`${pos.tokenB} Fees Value`]: tokenBPrice !== 0 && feesBValue > 0 ? `$${feesBValue.toFixed(2)}` : (tokenBPrice === 0 ? 'N/A' : '$0.00'),
-          ['Total Fees Value']: `$${totalFeesValueForRow.toFixed(2)}`
-        };
-      })
-    );
-    
-    // Calculate total fees value
-    const totalUncollectedFeesValue = positions.reduce((sum, pos) => {
-      const feesA_D = new Decimal(pos.feesOwed0 || 0);
-      const feesB_D = new Decimal(pos.feesOwed1 || 0);
-      const tokenAPrice = pos.tokenAPrice || 0;
-      const tokenBPrice = pos.tokenBPrice || 0;
-      return sum + feesA_D.mul(tokenAPrice).toNumber() + feesB_D.mul(tokenBPrice).toNumber();
-    }, 0);
-    console.log(`\n💸 Total Uncollected Fees: $${totalUncollectedFeesValue.toFixed(2)}`);
-    
-    // Grand total with fees
-    console.log(`\n💰 Grand Total (Portfolio Value + Fees): $${(totalPortfolioValueLiquidityOnly + totalUncollectedFeesValue).toFixed(2)}`);
+      // Create a map for quick position lookup
+      const feeMap = new Map(fees.map(fee => [fee.positionAddress, fee]));
+      
+      // Display uncollected fees
+      console.log('\n=== Uncollected Fees (Exact Calculation) ===');
+      console.table(
+        positions.map(pos => {
+          // Skip positions without a position address
+          if (!pos.positionAddress) {
+            return {
+              Pair: pos.pool,
+              [`${pos.tokenA} Fees`]: '0.00000000',
+              [`${pos.tokenA} Fees Value`]: '$0.00',
+              [`${pos.tokenB} Fees`]: '0.00000000',
+              [`${pos.tokenB} Fees Value`]: '$0.00',
+              ['Total Fees Value']: '$0.00'
+            };
+          }
+          
+          // Use the position address for matching fees
+          const fee = feeMap.get(pos.positionAddress);
+          
+          if (!fee) {
+            return {
+              Pair: pos.pool,
+              [`${pos.tokenA} Fees`]: '0.00000000',
+              [`${pos.tokenA} Fees Value`]: '$0.00',
+              [`${pos.tokenB} Fees`]: '0.00000000',
+              [`${pos.tokenB} Fees Value`]: '$0.00',
+              ['Total Fees Value']: '$0.00'
+            };
+          }
+          
+          return {
+            Pair: pos.pool,
+            [`${pos.tokenA} Fees`]: fee.feeA.toFixed(8),
+            [`${pos.tokenA} Fees Value`]: fee.feeAUsd ? `$${fee.feeAUsd.toFixed(2)}` : '$0.00',
+            [`${pos.tokenB} Fees`]: fee.feeB.toFixed(8),
+            [`${pos.tokenB} Fees Value`]: fee.feeBUsd ? `$${fee.feeBUsd.toFixed(2)}` : '$0.00',
+            ['Total Fees Value']: fee.totalUsd ? `$${fee.totalUsd.toFixed(2)}` : '$0.00'
+          };
+        })
+      );
+      
+      // Calculate total fees value
+      const totalUncollectedFeesValue = fees.reduce((sum, fee) => sum + (fee.totalUsd || 0), 0);
+      console.log(`\n💸 Total Uncollected Fees: $${totalUncollectedFeesValue.toFixed(2)}`);
+      
+      // Grand total with fees
+      console.log(`\n💰 Grand Total (Portfolio Value + Fees): $${(totalPortfolioValueLiquidityOnly + totalUncollectedFeesValue).toFixed(2)}`);
+    }
     
   } catch (error) {
     console.error('Error fetching Raydium positions:', error);
